@@ -16,7 +16,7 @@ rng = np.random.default_rng(rng_seed)
 params = {
     'nTrials': 3,
     'trialTime': 20 * second,
-    'dt': 1 * ms,
+    'dt': 0.1 * ms,
 
     'reportType': 'stdout',
     'reportPeriod': 10 * second,
