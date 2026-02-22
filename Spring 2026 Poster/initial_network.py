@@ -27,7 +27,7 @@ params = {
     'doProfile': True,
 
     # CS-US training (red = CS, blue = US; paper: 440 ms red @ 25 Hz, 80 ms blue @ 50 Hz)
-    'nTrials': 1,
+    'nTrials': 10,
     'ISI': 360 * ms,              # time from CS onset to US onset (inter-stimulus interval)
     'propCS': 0.05,               # fraction of excitatory neurons selected for CS (red)
     'propUS': 0.05,               # fraction of excitatory neurons selected for US (blue)
@@ -71,7 +71,7 @@ params = {
     'weightCV': 0.1,   # 10% std relative to mean
 
     # STDP (only EE when use_stdp is True)
-    'use_stdp': False,
+    'use_stdp': True,
     'tau_stdp_pre': 20 * ms,
     'tau_stdp_post': 20 * ms,
     'A_plus_stdp': 5 * pA,   # LTP when pre before post
@@ -228,17 +228,17 @@ tauRiseIOverMS = params['tauRiseInh'] / ms
 if params.get('use_stdp', False):
     eqs_EE = '''
     jEE : amp
-    dtrace_pre/dt = -trace_pre / tau_stdp_pre : 1 (event-driven)
-    dtrace_post/dt = -trace_post / tau_stdp_post : 1 (event-driven)
+    dapre/dt = -apre / tau_stdp_pre : 1 (event-driven)
+    dapost/dt = -apost / tau_stdp_post : 1 (event-driven)
     '''
     on_pre_EE = '''
     uE_post += jEE / tauRiseEOverMS
-    trace_pre += 1
-    jEE = clip(jEE + A_plus_stdp * trace_post, w_min_EE, w_max_EE)
+    apre += 1
+    jEE = clip(jEE + A_plus_stdp * apost, w_min_EE, w_max_EE)
     '''
     on_post_EE = '''
-    trace_post += 1
-    jEE = clip(jEE - A_minus_stdp * trace_pre, w_min_EE, w_max_EE)
+    apost += 1
+    jEE = clip(jEE - A_minus_stdp * apre, w_min_EE, w_max_EE)
     '''
     synapsesEE = Synapses(
         source=unitsExc,
@@ -250,8 +250,8 @@ if params.get('use_stdp', False):
     preInds, postInds = adjacency_indices_within(params['nExc'], params['propConnect'], rng)
     synapsesEE.connect(i=preInds, j=postInds)
     synapsesEE.jEE = normal_weights(params['jEE'], len(synapsesEE), params['weightCV'], rng)
-    synapsesEE.trace_pre = 0
-    synapsesEE.trace_post = 0
+    synapsesEE.apre = 0
+    synapsesEE.apost = 0
     synapsesEE.namespace.update({
         'tau_stdp_pre': params['tau_stdp_pre'],
         'tau_stdp_post': params['tau_stdp_post'],
