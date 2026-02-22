@@ -15,7 +15,7 @@ rng = np.random.default_rng(rng_seed)
 # =============================
 params = {
     'nTrials': 3,
-    'trialTime': 20 * second,
+    'trialTime': 2 * second,
     'dt': 0.1 * ms,
 
     'reportType': 'stdout',
@@ -23,14 +23,13 @@ params = {
     'doProfile': True,
 
     'nUnits': 2e3,
-    'propInh': 0.2,
+    'propInh': 0.20,
     'propConnect': 0.25,
 
     'eLeakExc': -65 * mV,
     'vResetExc': -58 * mV,
     'vThreshExc': -52 * mV,
-    'adaptTau': 500 * ms,
-    'betaAdaptExc': 12 * nA * ms,
+    'betaAdaptExc': 10 * nA * ms,
     'refrExc': 2.5 * ms,
     'membraneCapacitanceExc': 200 * pF,
     'gLeakExc': 10 * nS,
@@ -42,6 +41,8 @@ params = {
     'refrInh': 1 * ms,
     'membraneCapacitanceInh': 120 * pF,
     'gLeakInh': 8 * nS,
+
+    'adaptTau': 500 * ms,
 
     'noiseSigma': 1 * mV,
 
@@ -99,8 +100,6 @@ threshCode = 'v >= vThresh'
 
 params['nInh'] = int(params['propInh'] * params['nUnits'])
 params['nExc'] = int(params['nUnits'] - params['nInh'])
-params['nIncInh'] = int(params['propConnect'] * params['nInh'])
-params['nIncExc'] = int(params['propConnect'] * params['nExc'])
 
 unitsExc = NeuronGroup(
     N=params['nExc'],
@@ -121,10 +120,18 @@ unitsInh = NeuronGroup(
     clock=defaultclock,
 )
 
+mean_beta = params['betaAdaptExc']        # e.g. 0.02 * nA * ms
+std_beta  = 0.2 * mean_beta
+
 unitsExc.v = params['eLeakExc']
 unitsExc.vReset = params['vResetExc']
 unitsExc.vThresh = params['vThreshExc']
-unitsExc.betaAdapt = params['betaAdaptExc']
+unitsExc.betaAdapt = mean_beta
+# unitsExc.betaAdapt = np.random.normal(
+#     loc=mean_beta / (amp*second),
+#     scale=std_beta / (amp*second),
+#     size=len(unitsExc)
+# ) * amp * second
 unitsExc.eLeak = params['eLeakExc']
 unitsExc.Cm = params['membraneCapacitanceExc']
 unitsExc.gl = params['gLeakExc']
@@ -347,7 +354,7 @@ log_incoming_strength("II", synapsesII, "jII", len(unitsInh))
 spikeMonExc = SpikeMonitor(unitsExc)
 spikeMonInh = SpikeMonitor(unitsInh)
 
-stateMonExc = StateMonitor(unitsExc, ['sE', 'sI', 'v'], record=0)
+stateMonExc = StateMonitor(unitsExc, 'v', record=True)
 stateMonInh = StateMonitor(unitsInh, 'v', record=True)
 
 # =============================
@@ -375,21 +382,25 @@ results = SimpleResults(
     params
 )
 
-mean_sE = np.mean(stateMonExc.sE[0] / pA)
-mean_sI = np.mean(stateMonExc.sI[0] / pA)
-print("Mean sE:", mean_sE)
-print("Mean sI:", mean_sI)
-print("Difference:", mean_sE - mean_sI)
 
-deltaV = (mean_sE - mean_sI) * pA / params['gLeakExc']
-print("Predicted shift (mV):", deltaV / mV)
+fig = plt.figure(figsize=(8, 12))
+ax_raster = fig.add_subplot(4, 1, 1)
+ax_rate = fig.add_subplot(4, 1, 2)
+ax_voltage = fig.add_subplot(4, 1, 3)
+ax_pca = fig.add_subplot(4, 1, 4, projection='3d')
 
+# Raster
+results.plot_spike_raster(ax_raster)
 
-fig, axs = plt.subplots(3, 1, figsize=(8, 8))
+# Firing rate
+results.plot_firing_rate(ax_rate)
 
-results.plot_spike_raster(axs[0])
-results.plot_firing_rate(axs[1])
-results.plot_voltage(axs[2], unitType='Exc', neuron_index=0)
+# Voltage trace
+results.plot_voltage(ax_voltage, unitType='Exc', neuron_index=0, mean=False)
+
+# PCA: first 3 components with time as color
+results.plot_pca_3d_time_color(ax=ax_pca, use_upstate_only=False)
+
 
 plt.tight_layout()
 plt.show()
