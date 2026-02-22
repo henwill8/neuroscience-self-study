@@ -62,7 +62,7 @@ class SimpleResults:
 
         # --- Time vector for voltage traces
         self.stateDT = float(stateMonExc.clock.dt / second)
-        self.duration = float(params['trialTime'] / second)
+        self.duration = float(params['duration'] / second)
         self.stateMonT = np.arange(0, self.duration, self.stateDT)
 
     # -------------------------------------------------
@@ -221,21 +221,43 @@ class SimpleResults:
         return ax
 
     # -------------------------------------------------
-    # Raster plot
+    # Raster plot (excitatory with CS/US/other grouping, then inhibitory combined below)
     # -------------------------------------------------
     def plot_spike_raster(self, ax):
+        nExc = self.p['nExc']
+        nInh = self.p['nInh']
 
-        ax.scatter(self.spikeMonExcT,
-                   self.spikeMonExcI,
-                   s=1, c='cyan', marker='.')
+        # Excitatory: if CS/US defined, order as [CS | US | other] and color by group
+        if 'cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p:
+            cs_set = set(self.p['cs_neuron_inds'])
+            us_set = set(self.p['us_neuron_inds'])
+            cs_sorted = np.sort(self.p['cs_neuron_inds'])
+            us_sorted = np.sort(self.p['us_neuron_inds'])
+            other_sorted = np.sort([i for i in range(nExc) if i not in cs_set and i not in us_set])
+            order = np.concatenate([cs_sorted, us_sorted, other_sorted])
+            neuron_to_display = {n: i for i, n in enumerate(order)}
+            nCS, nUS = len(cs_sorted), len(us_sorted)
 
-        ax.scatter(self.spikeMonInhT,
-                   self.p['nExc'] + self.spikeMonInhI,
-                   s=1, c='red', marker='.')
+            t_exc = np.asarray(self.spikeMonExcT)
+            i_exc = np.asarray(self.spikeMonExcI)
+            y_exc = np.array([neuron_to_display[i] for i in i_exc])
+            colors_exc = np.array(['C3' if i in cs_set else ('C0' if i in us_set else '0.6') for i in i_exc])
+
+            ax.scatter(t_exc, y_exc, c=colors_exc, s=1, marker='.', linewidths=0)
+            ax.axhline(nCS - 0.5, color='k', lw=0.5, linestyle='-')
+            ax.axhline(nCS + nUS - 0.5, color='k', lw=0.5, linestyle='-')
+            # Inhibitory combined below excitatory
+            ax.scatter(self.spikeMonInhT, nExc + self.spikeMonInhI, s=1, c='red', marker='.', linewidths=0)
+            ax.axhline(nExc - 0.5, color='k', lw=0.5, linestyle='-')
+            ax.set_ylim(-0.5, self.p['nUnits'] - 0.5)
+            ax.set_ylabel("Neuron (CS | US | other | inh)")
+        else:
+            ax.scatter(self.spikeMonExcT, self.spikeMonExcI, s=1, c='cyan', marker='.')
+            ax.scatter(self.spikeMonInhT, nExc + self.spikeMonInhI, s=1, c='red', marker='.', linewidths=0)
+            ax.set_ylim(-0.5, self.p['nUnits'] - 0.5)
+            ax.set_ylabel("Neuron index")
 
         ax.set_xlim(0, self.duration)
-        ax.set_ylim(0, self.p['nUnits'])
-        ax.set_ylabel("Neuron index")
         ax.set_xlabel("Time (s)")
 
     # -------------------------------------------------
@@ -246,23 +268,16 @@ class SimpleResults:
 
         bin_size_s = float(bin_size / second)
         bins = np.arange(0, self.duration, bin_size_s)
-
-        FRExc, _ = np.histogram(self.spikeMonExcT, bins)
-        FRInh, _ = np.histogram(self.spikeMonInhT, bins)
-
-        FRExc = FRExc / bin_size_s / self.p['nExc']
-        FRInh = FRInh / bin_size_s / self.p['nInh']
-
         centers = bins[:-1] + bin_size_s / 2
+        nExc = self.p['nExc']
+        nInh = self.p['nInh']
 
         drew_upstate_span = False
-        # Upstate debug: shade upstate intervals (HMM on population spike count; draw first so under traces)
         if show_upstate:
             _, upstate_mask = self.detect_upstates(
                 bin_size=upstate_bin_size, use_exc_only=True,
                 p_stay=p_stay, rate_up_ratio=rate_up_ratio, rate_down_ratio=rate_down_ratio
             )
-            # Contiguous upstate runs -> axvspan (label only first span to avoid legend clutter)
             first_span = True
             upstate_bin_size_s = float(upstate_bin_size / second)
             i = 0
@@ -280,12 +295,45 @@ class SimpleResults:
                 first_span = False
                 drew_upstate_span = True
 
-        ax.plot(centers, FRExc, color='cyan', alpha=0.6)
-        ax.plot(centers, FRInh, color='red', alpha=0.6)
+        # Firing rate by group: CS, US, other exc, inh (if CS/US defined); else exc + inh
+        if 'cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p:
+            cs_set = set(self.p['cs_neuron_inds'])
+            us_set = set(self.p['us_neuron_inds'])
+            nCS, nUS = len(cs_set), len(us_set)
+            nOther = nExc - nCS - nUS
+            if nCS > 0:
+                mask_cs = np.isin(self.spikeMonExcI, self.p['cs_neuron_inds'])
+                t_cs = self.spikeMonExcT[mask_cs]
+                FR_CS, _ = np.histogram(t_cs, bins)
+                FR_CS = FR_CS / bin_size_s / nCS
+                ax.plot(centers, FR_CS, color='C3', alpha=0.8, label='CS')
+            if nUS > 0:
+                mask_us = np.isin(self.spikeMonExcI, self.p['us_neuron_inds'])
+                t_us = self.spikeMonExcT[mask_us]
+                FR_US, _ = np.histogram(t_us, bins)
+                FR_US = FR_US / bin_size_s / nUS
+                ax.plot(centers, FR_US, color='C0', alpha=0.8, label='US')
+            if nOther > 0:
+                other_set = set(range(nExc)) - cs_set - us_set
+                mask_other = np.isin(self.spikeMonExcI, np.array(list(other_set)))
+                t_other = self.spikeMonExcT[mask_other]
+                FR_other, _ = np.histogram(t_other, bins)
+                FR_other = FR_other / bin_size_s / nOther
+                ax.plot(centers, FR_other, color='0.6', alpha=0.6, label='other exc')
+            FRInh, _ = np.histogram(self.spikeMonInhT, bins)
+            FRInh = FRInh / bin_size_s / nInh
+            ax.plot(centers, FRInh, color='red', alpha=0.6, label='inh')
+        else:
+            FRExc, _ = np.histogram(self.spikeMonExcT, bins)
+            FRInh, _ = np.histogram(self.spikeMonInhT, bins)
+            FRExc = FRExc / bin_size_s / nExc
+            FRInh = FRInh / bin_size_s / nInh
+            ax.plot(centers, FRExc, color='cyan', alpha=0.6)
+            ax.plot(centers, FRInh, color='red', alpha=0.6)
 
         ax.set_ylabel("Firing rate (Hz)")
         ax.set_xlabel("Time (s)")
-        if show_upstate and drew_upstate_span:
+        if (show_upstate and drew_upstate_span) or ('cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p):
             ax.legend(loc='upper right', fontsize=7)
 
     # -------------------------------------------------

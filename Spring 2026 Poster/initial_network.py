@@ -1,4 +1,3 @@
-from Tools.scripts.fixdiv import report
 from brian2 import *
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,12 +14,23 @@ rng = np.random.default_rng(rng_seed)
 # =============================
 params = {
     'nTrials': 3,
-    'trialTime': 2 * second,
     'dt': 0.1 * ms,
 
     'reportType': 'stdout',
     'reportPeriod': 10 * second,
     'doProfile': True,
+
+    # CS-US training (red = CS, blue = US; paper: 440 ms red @ 25 Hz, 80 ms blue @ 50 Hz)
+    'ISI': 360 * ms,              # time from CS onset to US onset (inter-stimulus interval)
+    'propCS': 0.05,               # fraction of excitatory neurons selected for CS (red)
+    'propUS': 0.05,               # fraction of excitatory neurons selected for US (blue)
+    'interTrialInterval': 2 * second,
+    'CS_train_duration': 440 * ms,
+    'CS_Hz': 25 * Hz,
+    'US_train_duration': 80 * ms,
+    'US_Hz': 50 * Hz,
+
+    'spikeInputAmplitude': 0.98,  # current (nA) per CS/US pulse
 
     'nUnits': 2e3,
     'propInh': 0.20,
@@ -58,12 +68,17 @@ params = {
     'tauFallInh': 1 * ms,
     'delayExc': 1 * ms,
     'delayInh': 0.5 * ms,
-
-    # external kick
-    'propKickedSpike': 0.05,
-    'poissonLambda': 0.5 * Hz,
-    'spikeInputAmplitude': 0.98
 }
+
+# Derive duration from trial setup (no single duration param)
+def _trial_duration(p):
+    return max(float(p['CS_train_duration'] / second),
+               float((p['ISI'] + p['US_train_duration']) / second))
+
+params['trialDuration'] = _trial_duration(params) * second
+params['trialPeriod'] = params['trialDuration'] + params['interTrialInterval']  # time from one trial start to next
+params['duration'] = (params['nTrials'] * float(params['trialPeriod'] / second) -
+                      float(params['interTrialInterval'] / second) + 0.5) * second
 
 defaultclock.dt = params['dt']
 
@@ -145,37 +160,52 @@ unitsInh.Cm = params['membraneCapacitanceInh']
 unitsInh.gl = params['gLeakInh']
 
 # =============================
-# Poisson Kicks
+# CS-US training (recurring activation of CS and US neuron subsets)
 # =============================
-def poisson_single(rate, dt, duration):
-    timeArray = np.arange(0, float(duration), float(dt))
-    randArray = rng.random(*timeArray.shape)
-    spikeBool = randArray < (rate * dt)
+nCS = max(1, int(round(params['propCS'] * params['nExc'])))
+nUS = max(1, int(round(params['propUS'] * params['nExc'])))
+cs_neuron_inds = rng.choice(params['nExc'], size=nCS, replace=False)
+us_neuron_inds = rng.choice(params['nExc'], size=nUS, replace=False)
+params['cs_neuron_inds'] = cs_neuron_inds
+params['us_neuron_inds'] = us_neuron_inds
 
-    times = timeArray[spikeBool]
+def _pulse_times_train(trial_starts_s, train_duration_s, freq_Hz, dt_s=0.0001):
+    """For each trial start, generate pulse times at freq_Hz for train_duration_s."""
+    period_s = 1.0 / float(freq_Hz)
+    times = []
+    for t0 in trial_starts_s:
+        t = 0.0
+        while t < train_duration_s:
+            times.append(t0 + t)
+            t += period_s
+    return np.array(times)
 
-    return times
+trial_starts_s = np.array([tr * float(params['trialPeriod'] / second) for tr in range(params['nTrials'])])
 
-kickTimes = poisson_single(params['poissonLambda'], params['dt'], params['trialTime'])
-
-spikeUnits = int(np.round(params['propKickedSpike'] * params['nUnits']))
-
-indices = []
-times = []
-for kickTime in kickTimes:
-    indices.extend(list(range(spikeUnits)))
-    times.extend([float(kickTime), ] * spikeUnits)
-
-params['upPoissonTimes'] = kickTimes
-
-Uppers = SpikeGeneratorGroup(spikeUnits, np.array(indices), np.array(times) * second)
-
-feedforwardUpExc = Synapses(
-    source=Uppers,
-    target=unitsExc,
-    on_pre='uExt_post += ' + str(params['spikeInputAmplitude']) + ' * nA'
+cs_times_s = _pulse_times_train(
+    trial_starts_s,
+    float(params['CS_train_duration'] / second),
+    float(params['CS_Hz'] / Hz),
 )
-feedforwardUpExc.connect('i==j')
+us_times_s = _pulse_times_train(
+    trial_starts_s + float(params['ISI'] / second),
+    float(params['US_train_duration'] / second),
+    float(params['US_Hz'] / Hz),
+)
+
+# Expand to one spike per target neuron per pulse time
+cs_indices_src = np.repeat(np.arange(nCS), len(cs_times_s))
+cs_times_expanded = np.tile(cs_times_s, nCS)
+us_indices_src = np.repeat(np.arange(nUS), len(us_times_s))
+us_times_expanded = np.tile(us_times_s, nUS)
+
+CS_group = SpikeGeneratorGroup(nCS, cs_indices_src, cs_times_expanded * second)
+US_group = SpikeGeneratorGroup(nUS, us_indices_src, us_times_expanded * second)
+
+syn_CS = Synapses(CS_group, unitsExc, on_pre='uExt_post += ' + str(params['spikeInputAmplitude']) + ' * nA')
+syn_CS.connect(i=np.arange(nCS), j=cs_neuron_inds)
+syn_US = Synapses(US_group, unitsExc, on_pre='uExt_post += ' + str(params['spikeInputAmplitude']) + ' * nA')
+syn_US.connect(i=np.arange(nUS), j=us_neuron_inds)
 
 # =============================
 # Recurrent synapses
@@ -201,8 +231,6 @@ def adjacency_indices_between(nUnitsPre, nUnitsPost, pConn):
     preInds, postInds = np.unravel_index(indicesFlat, (nUnitsPre, nUnitsPost))
 
     return preInds, postInds
-
-from brian2.units import *
 
 def normal_weights(mean_current, syn):
     n = len(syn)
@@ -369,7 +397,7 @@ tauRiseI = params['tauRiseInh']
 tauFallI = params['tauFallInh']
 tauAdapt = params['adaptTau']
 
-run(params['trialTime'], report=params['reportType'], report_period=params['reportPeriod'], profile=params['doProfile'])
+run(params['duration'], report=params['reportType'], report_period=params['reportPeriod'], profile=params['doProfile'])
 
 # =============================
 # Plots
@@ -389,7 +417,7 @@ ax_rate = fig.add_subplot(4, 1, 2)
 ax_voltage = fig.add_subplot(4, 1, 3)
 ax_pca = fig.add_subplot(4, 1, 4, projection='3d')
 
-# Raster
+# Raster (excitatory CS | US | other, then inhibitory)
 results.plot_spike_raster(ax_raster)
 
 # Firing rate
