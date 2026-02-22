@@ -70,12 +70,24 @@ params = {
     'jII': 282 * pA,
     'weightCV': 0.1,   # 10% std relative to mean
 
+    # STDP (only EE when use_stdp is True)
+    'use_stdp': False,
+    'tau_stdp_pre': 20 * ms,
+    'tau_stdp_post': 20 * ms,
+    'A_plus_stdp': 5 * pA,   # LTP when pre before post
+    'A_minus_stdp': 5 * pA,  # LTD when post before pre
+    'w_min_EE': 0 * pA,
+    'w_max_EE': 500 * pA,
+
     'tauRiseExc': 8 * ms,
     'tauFallExc': 23 * ms,
     'tauRiseInh': 1 * ms,
     'tauFallInh': 1 * ms,
     'delayExc': 1 * ms,
     'delayInh': 0.5 * ms,
+
+    # Voltage recording: how many neurons per population to record (None = all)
+    'n_record_voltage': 100,
 }
 
 # Derive duration from trial setup (no single duration param)
@@ -212,18 +224,54 @@ syn_US.connect(i=np.arange(nUS), j=us_neuron_inds)
 tauRiseEOverMS = params['tauRiseExc'] / ms
 tauRiseIOverMS = params['tauRiseInh'] / ms
 
-# from E to E
-synapsesEE = Synapses(
-    model='jEE: amp',
-    source=unitsExc,
-    target=unitsExc,
-    on_pre='uE_post += jEE / tauRiseEOverMS',  # 'uE_post += 1 / tauRiseEOverMS'
-)
-preInds, postInds = adjacency_indices_within(params['nExc'], params['propConnect'], rng)
-synapsesEE.connect(i=preInds, j=postInds)
+# from E to E (with optional STDP)
+if params.get('use_stdp', False):
+    eqs_EE = '''
+    jEE : amp
+    dtrace_pre/dt = -trace_pre / tau_stdp_pre : 1 (event-driven)
+    dtrace_post/dt = -trace_post / tau_stdp_post : 1 (event-driven)
+    '''
+    on_pre_EE = '''
+    uE_post += jEE / tauRiseEOverMS
+    trace_pre += 1
+    jEE = clip(jEE + A_plus_stdp * trace_post, w_min_EE, w_max_EE)
+    '''
+    on_post_EE = '''
+    trace_post += 1
+    jEE = clip(jEE - A_minus_stdp * trace_pre, w_min_EE, w_max_EE)
+    '''
+    synapsesEE = Synapses(
+        source=unitsExc,
+        target=unitsExc,
+        model=eqs_EE,
+        on_pre=on_pre_EE,
+        on_post=on_post_EE,
+    )
+    preInds, postInds = adjacency_indices_within(params['nExc'], params['propConnect'], rng)
+    synapsesEE.connect(i=preInds, j=postInds)
+    synapsesEE.jEE = normal_weights(params['jEE'], len(synapsesEE), params['weightCV'], rng)
+    synapsesEE.trace_pre = 0
+    synapsesEE.trace_post = 0
+    synapsesEE.namespace.update({
+        'tau_stdp_pre': params['tau_stdp_pre'],
+        'tau_stdp_post': params['tau_stdp_post'],
+        'A_plus_stdp': params['A_plus_stdp'],
+        'A_minus_stdp': params['A_minus_stdp'],
+        'w_min_EE': params['w_min_EE'],
+        'w_max_EE': params['w_max_EE'],
+    })
+else:
+    synapsesEE = Synapses(
+        model='jEE: amp',
+        source=unitsExc,
+        target=unitsExc,
+        on_pre='uE_post += jEE / tauRiseEOverMS',
+    )
+    preInds, postInds = adjacency_indices_within(params['nExc'], params['propConnect'], rng)
+    synapsesEE.connect(i=preInds, j=postInds)
+    synapsesEE.jEE = normal_weights(params['jEE'], len(synapsesEE), params['weightCV'], rng)
 paramsreEE = preInds
 paramsosEE = postInds
-synapsesEE.jEE = normal_weights(params['jEE'], len(synapsesEE), params['weightCV'], rng)
 
 # from E to I
 synapsesEI = Synapses(
@@ -310,8 +358,21 @@ params['weight_matrix_pre'] = build_weight_matrix(
 spikeMonExc = SpikeMonitor(unitsExc)
 spikeMonInh = SpikeMonitor(unitsInh)
 
-stateMonExc = StateMonitor(unitsExc, 'v', record=True)
-stateMonInh = StateMonitor(unitsInh, 'v', record=True)
+n_rec = params.get('n_record_voltage')
+# Evenly spaced indices so we get a proportional spread across CS, US, other (not just 0..n_rec-1)
+if n_rec is None:
+    record_exc = True
+    record_inh = True
+else:
+    n_re = min(int(n_rec), params['nExc'])
+    n_ri = min(int(n_rec), params['nInh'])
+    record_exc = np.linspace(0, params['nExc'] - 1, n_re, dtype=int)
+    record_inh = np.linspace(0, params['nInh'] - 1, n_ri, dtype=int)
+# Store which neuron indices are in each recorded row (for mapping in plots)
+params['record_voltage_exc_inds'] = np.arange(params['nExc']) if record_exc is True else np.asarray(record_exc)
+params['record_voltage_inh_inds'] = np.arange(params['nInh']) if record_inh is True else np.asarray(record_inh)
+stateMonExc = StateMonitor(unitsExc, 'v', record=record_exc)
+stateMonInh = StateMonitor(unitsInh, 'v', record=record_inh)
 
 # =============================
 # Running

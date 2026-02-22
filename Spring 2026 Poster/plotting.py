@@ -286,11 +286,15 @@ class SimpleResults:
                     spike_peak_mV=0.0):
         if unitType == 'Exc':
             V = np.asarray(self.stateMonExcV)
+            record_inds = self.p.get('record_voltage_exc_inds')
+            record_inds = np.arange(V.shape[0]) if record_inds is None else np.atleast_1d(record_inds)
             color = 'cyan'
             spike_times = np.asarray(self.spikeMonExcT)[self.spikeMonExcI == neuron_index]
             thresh = float(self.p.get('vThreshExc', -52) / mV) if 'vThreshExc' in self.p else -52
         else:
             V = np.asarray(self.stateMonInhV)
+            record_inds = self.p.get('record_voltage_inh_inds')
+            record_inds = np.arange(V.shape[0]) if record_inds is None else np.atleast_1d(record_inds)
             color = 'red'
             spike_times = np.asarray(self.spikeMonInhT)[self.spikeMonInhI == neuron_index]
             thresh = float(self.p.get('vThreshInh', -43) / mV) if 'vThreshInh' in self.p else -43
@@ -298,7 +302,11 @@ class SimpleResults:
             v = V.mean(axis=0)
             lw = 0.8
         else:
-            v = V[neuron_index]
+            row = np.where(record_inds == neuron_index)[0]
+            if len(row) == 0:
+                ax.set_title(f"Neuron {neuron_index} not in recorded set")
+                return ax
+            v = V[row[0]]
             lw = 0.6
         ax.plot(self.stateMonT, v, color=color, lw=lw)
         # Draw vertical spike markers for single-neuron trace
@@ -313,13 +321,23 @@ class SimpleResults:
         V_exc = np.asarray(self.stateMonExcV)
         V_inh = np.asarray(self.stateMonInhV)
         t = self.stateMonT
-        if ax is None:
-            fig, ax = plt.subplots()
+        # record_voltage_*_inds[i] = neuron index for row i in V (so we can map group indices to rows)
+        rec_exc = self.p.get('record_voltage_exc_inds')
+        rec_inh = self.p.get('record_voltage_inh_inds')
+        if rec_exc is None:
+            rec_exc = np.arange(V_exc.shape[0])
+        if rec_inh is None:
+            rec_inh = np.arange(V_inh.shape[0])
+        rec_exc = np.atleast_1d(rec_exc)
+        rec_inh = np.atleast_1d(rec_inh)
 
-        def plot_group(inds, V, color, label):
-            if len(inds) == 0:
+        def plot_group(neuron_inds, V, record_inds, color, label):
+            # Map neuron indices to row indices: row k in V corresponds to neuron record_inds[k]
+            neuron_inds = np.atleast_1d(neuron_inds)
+            row_inds = np.where(np.isin(record_inds, neuron_inds))[0]
+            if len(row_inds) == 0:
                 return
-            sub = V[inds]
+            sub = V[row_inds]
             mean = sub.mean(axis=0)
             n = sub.shape[0]
             err = sub.std(axis=0) / (np.sqrt(n) if use_sem else 1.0) if n > 1 else np.zeros_like(mean)
@@ -327,17 +345,17 @@ class SimpleResults:
             ax.fill_between(t, mean - err, mean + err, color=color, alpha=0.3)
 
         if 'cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p:
-            cs_inds = self.p['cs_neuron_inds']
-            us_inds = self.p['us_neuron_inds']
+            cs_inds = np.atleast_1d(self.p['cs_neuron_inds'])
+            us_inds = np.atleast_1d(self.p['us_neuron_inds'])
             nExc = self.p['nExc']
             other_inds = np.array([i for i in range(nExc) if i not in cs_inds and i not in us_inds])
-            plot_group(cs_inds, V_exc, 'C3', 'CS')
-            plot_group(us_inds, V_exc, 'C0', 'US')
-            plot_group(other_inds, V_exc, '0.6', 'other exc')
-            plot_group(np.arange(V_inh.shape[0]), V_inh, 'red', 'inh')
+            plot_group(cs_inds, V_exc, rec_exc, 'C3', 'CS')
+            plot_group(us_inds, V_exc, rec_exc, 'C0', 'US')
+            plot_group(other_inds, V_exc, rec_exc, '0.6', 'other exc')
+            plot_group(rec_inh, V_inh, rec_inh, 'red', 'inh')
         else:
-            plot_group(np.arange(V_exc.shape[0]), V_exc, 'cyan', 'exc')
-            plot_group(np.arange(V_inh.shape[0]), V_inh, 'red', 'inh')
+            plot_group(rec_exc, V_exc, rec_exc, 'cyan', 'exc')
+            plot_group(rec_inh, V_inh, rec_inh, 'red', 'inh')
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Voltage (mV)")
         ax.legend(loc='upper right', fontsize=7)
