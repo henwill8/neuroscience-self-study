@@ -3,8 +3,11 @@ from scipy.special import gammaln
 from brian2 import *
 import matplotlib.pyplot as plt
 from matplotlib import cm
-from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, LinearSegmentedColormap
 from mpl_toolkits.mplot3d import Axes3D
+
+# Black (zero weight) to yellow (max weight) for weight matrices
+BLACK_YELLOW_CMAP = LinearSegmentedColormap.from_list('black_yellow', ['black', 'yellow'], N=256)
 
 
 def _hmm_viterbi_poisson(counts, trans_mat, lambda_down, lambda_up):
@@ -19,7 +22,7 @@ def _hmm_viterbi_poisson(counts, trans_mat, lambda_down, lambda_up):
     lambda_down = max(1e-10, float(lambda_down))
     lambda_up = max(1e-10, float(lambda_up))
     log_trans = np.log(trans_mat + 1e-20)
-    # log P(y|s) = y*log(lam_s) - lam_s - gammaln(y+1)
+
     def log_emit(s, y):
         lam = lambda_down if s == 0 else lambda_up
         return y * np.log(lam) - lam - gammaln(y + 1)
@@ -42,192 +45,148 @@ def _hmm_viterbi_poisson(counts, trans_mat, lambda_down, lambda_up):
     return path
 
 
+# ---------------------------------------------------------------------------
+# Module-level computation functions (take results + optional params)
+# ---------------------------------------------------------------------------
+
+def compute_population_matrix(results, bin_size=5*ms, use_exc_only=True, subtract_mean=True):
+    """Binned firing rate matrix (n_bins, n_neurons)."""
+    bin_size_s = float(bin_size / second)
+    bins = np.arange(0, results.duration, bin_size_s)
+    n_neurons = results.p['nExc'] if use_exc_only else results.p['nUnits']
+    X = np.zeros((len(bins) - 1, n_neurons))
+
+    for i in range(results.p['nExc']):
+        spikes = results.spikeMonExcT[results.spikeMonExcI == i]
+        counts, _ = np.histogram(spikes, bins)
+        X[:, i] = counts / bin_size_s  # Hz
+
+    if not use_exc_only:
+        for i in range(results.p['nInh']):
+            spikes = results.spikeMonInhT[results.spikeMonInhI == i]
+            counts, _ = np.histogram(spikes, bins)
+            X[:, results.p['nExc'] + i] = counts / bin_size_s
+
+    if subtract_mean:
+        X = X - X.mean(axis=0)
+    return X
+
+
+def compute_pca_projection(results, bin_size=5*ms, use_exc_only=True, n_components=3):
+    """Project binned population activity onto first n_components PCs. Returns (centers, proj)."""
+    bin_size_s = float(bin_size / second)
+    bins = np.arange(0, results.duration, bin_size_s)
+    centers = bins[:-1] + bin_size_s / 2
+    X = compute_population_matrix(results, bin_size, use_exc_only)
+    U, S, Vt = np.linalg.svd(X, full_matrices=False)
+    proj = X @ Vt[:n_components].T
+    return centers, proj
+
+
+def detect_upstates(results, bin_size=10*ms, use_exc_only=True,
+                    p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0):
+    """
+    Label each time bin as UP or DOWN via two-state HMM on population spike count.
+    Returns (centers, upstate_mask).
+    """
+    bin_size_s = float(bin_size / second)
+    bins = np.arange(0, results.duration, bin_size_s)
+    centers = bins[:-1] + bin_size_s / 2
+    count, _ = np.histogram(results.spikeMonExcT, bins)
+    count = np.asarray(count, dtype=float)
+
+    mean_count = np.maximum(count.mean(), 1.0)
+    r = rate_up_ratio / rate_down_ratio
+    lambda_down = (2 * mean_count) / (1 + r)
+    lambda_up = lambda_down * r
+
+    p_switch = 1.0 - p_stay
+    trans_mat = np.array([[p_stay, p_switch], [p_switch, p_stay]])
+    states = _hmm_viterbi_poisson(count, trans_mat, lambda_down, lambda_up)
+    upstate_mask = (states == 1)
+    return centers, upstate_mask
+
+
+def compute_within_between_correlations(results, bin_size=5*ms):
+    """
+    Mean correlation within (CS, US, other) and between (CS-US, CS-other, US-other).
+    Returns dict or None if CS/US not in params.
+    """
+    if 'cs_neuron_inds' not in results.p or 'us_neuron_inds' not in results.p:
+        return None
+    X = compute_population_matrix(results, bin_size, use_exc_only=True, subtract_mean=False)
+    R = np.corrcoef(X.T)
+    nExc = results.p['nExc']
+    cs_set = set(results.p['cs_neuron_inds'])
+    us_set = set(results.p['us_neuron_inds'])
+    other_inds = np.array([i for i in range(nExc) if i not in cs_set and i not in us_set])
+    cs_inds = np.array(results.p['cs_neuron_inds'])
+    us_inds = np.array(results.p['us_neuron_inds'])
+
+    def mean_upper_triangle(R_sub):
+        n = R_sub.shape[0]
+        if n < 2:
+            return np.nan
+        triu = np.triu_indices(n, k=1)
+        return np.nanmean(R_sub[triu])
+
+    out = {}
+    out['within_CS'] = mean_upper_triangle(R[np.ix_(cs_inds, cs_inds)]) if len(cs_inds) >= 2 else np.nan
+    out['within_US'] = mean_upper_triangle(R[np.ix_(us_inds, us_inds)]) if len(us_inds) >= 2 else np.nan
+    out['within_other'] = mean_upper_triangle(R[np.ix_(other_inds, other_inds)]) if len(other_inds) >= 2 else np.nan
+    out['between_CS_US'] = np.nanmean(R[np.ix_(cs_inds, us_inds)]) if len(cs_inds) and len(us_inds) else np.nan
+    out['between_CS_other'] = np.nanmean(R[np.ix_(cs_inds, other_inds)]) if len(cs_inds) and len(other_inds) else np.nan
+    out['between_US_other'] = np.nanmean(R[np.ix_(us_inds, other_inds)]) if len(us_inds) and len(other_inds) else np.nan
+    return out
+
+
+def compute_pca_variance_explained(results, bin_size=5*ms, use_exc_only=True,
+                                   use_upstate_only=False, upstate_bin_size=10*ms,
+                                   p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0):
+    """Variance explained by each PC (%). Returns 1d array."""
+    X = compute_population_matrix(results, bin_size, use_exc_only, subtract_mean=False)
+    if use_upstate_only:
+        _, upstate_mask_coarse = detect_upstates(results, bin_size=upstate_bin_size, use_exc_only=use_exc_only,
+                                                  p_stay=p_stay, rate_up_ratio=rate_up_ratio, rate_down_ratio=rate_down_ratio)
+        upstate_bin_size_s = float(upstate_bin_size / second)
+        bin_size_s = float(bin_size / second)
+        bins = np.arange(0, results.duration, bin_size_s)
+        centers = bins[:-1] + bin_size_s / 2
+        upstate_mask = np.zeros(len(centers), dtype=bool)
+        for i in range(len(centers)):
+            k = min(int(centers[i] / upstate_bin_size_s), len(upstate_mask_coarse) - 1)
+            if k >= 0:
+                upstate_mask[i] = upstate_mask_coarse[k]
+        X = X[upstate_mask] - X[upstate_mask].mean(axis=0)
+    else:
+        X = X - X.mean(axis=0)
+    U, S, Vt = np.linalg.svd(X, full_matrices=False)
+    var_explained = (S ** 2) / (S ** 2).sum()
+    return var_explained * 100
+
+
+# ---------------------------------------------------------------------------
+# SimpleResults: data container + plotting only
+# ---------------------------------------------------------------------------
+
 class SimpleResults:
-    def __init__(self, spikeMonExc, spikeMonInh,
-                 stateMonExc, stateMonInh,
-                 params):
+    """Holds spike/voltage data and params. Plotting methods only; computation is in module-level functions."""
 
+    def __init__(self, spikeMonExc, spikeMonInh, stateMonExc, stateMonInh, params):
         self.p = params
-
-        # --- Store spike data (convert to seconds)
         self.spikeMonExcT = spikeMonExc.t / second
         self.spikeMonExcI = spikeMonExc.i
-
         self.spikeMonInhT = spikeMonInh.t / second
         self.spikeMonInhI = spikeMonInh.i
-
-        # --- Store voltages (convert to mV)
         self.stateMonExcV = stateMonExc.v / mV
         self.stateMonInhV = stateMonInh.v / mV
-
-        # --- Time vector for voltage traces
         self.stateDT = float(stateMonExc.clock.dt / second)
         self.duration = float(params['duration'] / second)
         self.stateMonT = np.arange(0, self.duration, self.stateDT)
 
-    # -------------------------------------------------
-    # Build population activity matrix (binned rates)
-    # -------------------------------------------------
-    def compute_population_matrix(self, bin_size=5*ms, use_exc_only=True, subtract_mean=True):
-
-        bin_size_s = float(bin_size / second)
-        bins = np.arange(0, self.duration, bin_size_s)
-
-        n_neurons = self.p['nExc'] if use_exc_only else self.p['nUnits']
-        X = np.zeros((len(bins) - 1, n_neurons))
-
-        for i in range(self.p['nExc']):
-            spikes = self.spikeMonExcT[self.spikeMonExcI == i]
-            counts, _ = np.histogram(spikes, bins)
-            X[:, i] = counts / bin_size_s  # Hz
-
-        if not use_exc_only:
-            for i in range(self.p['nInh']):
-                spikes = self.spikeMonInhT[self.spikeMonInhI == i]
-                counts, _ = np.histogram(spikes, bins)
-                X[:, self.p['nExc'] + i] = counts / bin_size_s
-
-        if subtract_mean:
-            X = X - X.mean(axis=0)
-        return X
-
-    # -------------------------------------------------
-    # PCA projection onto first n components (for 3D plot)
-    # -------------------------------------------------
-    def compute_pca_projection(self, bin_size=5*ms, use_exc_only=True, n_components=3):
-        """
-        Project binned population activity onto the first n_components PCs.
-        Returns time_centers (s), and proj (n_bins, n_components) in same order as PCs.
-        """
-        bin_size_s = float(bin_size / second)
-        bins = np.arange(0, self.duration, bin_size_s)
-        centers = bins[:-1] + bin_size_s / 2
-
-        X = self.compute_population_matrix(bin_size, use_exc_only)
-        # SVD: X = U @ diag(S) @ Vt; projection onto first k right singular vectors is X @ Vt[:k].T
-        U, S, Vt = np.linalg.svd(X, full_matrices=False)
-        proj = X @ Vt[:n_components].T  # (n_bins, n_components)
-        return centers, proj
-
-    # -------------------------------------------------
-    # Upstate detection (HMM on population spike count, Luczak/Chen et al. style)
-    # -------------------------------------------------
-    def detect_upstates(self, bin_size=10*ms, use_exc_only=True,
-                        p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0):
-        """
-        Label each time bin as UP or DOWN using a two-state hidden Markov model
-        on the population spike count (pooled excitatory activity), as in
-        Luczak et al. / Saleem et al. / Chen et al.: the population spike count
-        is treated as a single point process whose rate is modulated by a
-        discrete hidden state. Viterbi decoding gives the state per bin.
-        Adjacent bins in the same state define UP and DOWN periods.
-
-        Parameters (Chen et al. 2009 style):
-        - bin_size: bin T for population count (default 10 ms).
-        - p_stay: P(same state next bin); 1 - p_stay = P(switch). Paper: PDD=PUU=0.9.
-        - rate_up_ratio, rate_down_ratio: relative Poisson rates (α=3, α+μ=1 in paper).
-          Actual rates are scaled so (λ_down + λ_up)/2 = observed mean count.
-
-        Returns time_centers (s), upstate_mask (bool, length n_bins).
-        """
-        bin_size_s = float(bin_size / second)
-        bins = np.arange(0, self.duration, bin_size_s)
-        centers = bins[:-1] + bin_size_s / 2
-        n_bins = len(centers)
-
-        # Population spike count per bin (pool excitatory spikes)
-        count, _ = np.histogram(self.spikeMonExcT, bins)
-        count = np.asarray(count, dtype=float)
-
-        # Scale emission rates to data: keep paper ratio (UP/DOWN = 3), mean = observed mean
-        mean_count = np.maximum(count.mean(), 1.0)
-        r = rate_up_ratio / rate_down_ratio  # λ_up / λ_down
-        lambda_down = (2 * mean_count) / (1 + r)
-        lambda_up = lambda_down * r
-
-        # Transition matrix: row i = current state, col j = next state; 0=DOWN, 1=UP
-        p_switch = 1.0 - p_stay
-        trans_mat = np.array([[p_stay, p_switch], [p_switch, p_stay]])
-
-        states = _hmm_viterbi_poisson(count, trans_mat, lambda_down, lambda_up)
-        upstate_mask = (states == 1)
-        return centers, upstate_mask
-
-    # -------------------------------------------------
-    # Plot first 3 PCs as connected line; upstate segments colored differently
-    # -------------------------------------------------
-    def plot_pca_3d_time_color(self, ax=None, bin_size=5*ms, use_exc_only=True,
-                               use_upstate_only=True, upstate_bin_size=10*ms,
-                               p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0,
-                               line_alpha=0.85, line_lw=0.8, cmap='viridis'):
-        """
-        Plot the first 3 PCs of population activity. Color = time during trial.
-
-        use_upstate_only: if True, PCA is fit on upstate bins only and the trajectory
-          shows only upstate times. If False, PCA is fit on the full simulation and
-          the full trajectory is plotted.
-        """
-        bin_size_s = float(bin_size / second)
-        bins = np.arange(0, self.duration, bin_size_s)
-        centers = bins[:-1] + bin_size_s / 2
-
-        X = self.compute_population_matrix(bin_size, use_exc_only, subtract_mean=False)
-
-        if use_upstate_only:
-            _, upstate_mask_coarse = self.detect_upstates(
-                bin_size=upstate_bin_size, use_exc_only=use_exc_only,
-                p_stay=p_stay, rate_up_ratio=rate_up_ratio, rate_down_ratio=rate_down_ratio
-            )
-            upstate_bin_size_s = float(upstate_bin_size / second)
-            upstate_mask = np.zeros(len(centers), dtype=bool)
-            for i in range(len(centers)):
-                k = min(int(centers[i] / upstate_bin_size_s), len(upstate_mask_coarse) - 1)
-                if k >= 0:
-                    upstate_mask[i] = upstate_mask_coarse[k]
-
-            X_use = X[upstate_mask] - X[upstate_mask].mean(axis=0)
-            centers_use = centers[upstate_mask]
-            if X_use.shape[0] < 2:
-                if ax is None:
-                    fig, ax = plt.subplots(subplot_kw=dict(projection='3d'))
-                ax.set_title("First 3 PCs (upstate only; no upstate bins)")
-                return ax
-        else:
-            X_use = X - X.mean(axis=0)
-            centers_use = centers
-
-        U, S, Vt = np.linalg.svd(X_use, full_matrices=False)
-        proj = X_use @ Vt[:3].T
-        for j in range(3):
-            col = proj[:, j]
-            proj[:, j] = (col - col.mean()) / (col.std() + 1e-10)
-        pc1, pc2, pc3 = proj[:, 0], proj[:, 1], proj[:, 2]
-        t_plot = centers_use
-
-        if ax is None:
-            fig = plt.figure()
-            ax = fig.add_subplot(111, projection='3d')
-        norm = Normalize(vmin=t_plot.min(), vmax=t_plot.max())
-        for i in range(len(pc1) - 1):
-            c = plt.get_cmap(cmap)(norm((t_plot[i] + t_plot[i + 1]) / 2))
-            ax.plot(pc1[i:i+2], pc2[i:i+2], pc3[i:i+2], color=c, alpha=line_alpha, lw=line_lw)
-        sm = cm.ScalarMappable(norm=norm, cmap=plt.get_cmap(cmap))
-        sm.set_array([])
-        ax.set_xlabel("PC1")
-        ax.set_ylabel("PC2")
-        ax.set_zlabel("PC3")
-        ax.set_title("First 3 PCs (upstate only)" if use_upstate_only else "First 3 PCs (full simulation)")
-        plt.colorbar(sm, ax=ax, shrink=0.6, label="Time (s)")
-        return ax
-
-    # -------------------------------------------------
-    # Raster plot (excitatory with CS/US/other grouping, then inhibitory combined below)
-    # -------------------------------------------------
     def plot_spike_raster(self, ax):
         nExc = self.p['nExc']
         nInh = self.p['nInh']
-
-        # Excitatory: if CS/US defined, order as [CS | US | other] and color by group
         if 'cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p:
             cs_set = set(self.p['cs_neuron_inds'])
             us_set = set(self.p['us_neuron_inds'])
@@ -237,16 +196,12 @@ class SimpleResults:
             order = np.concatenate([cs_sorted, us_sorted, other_sorted])
             neuron_to_display = {n: i for i, n in enumerate(order)}
             nCS, nUS = len(cs_sorted), len(us_sorted)
-
             t_exc = np.asarray(self.spikeMonExcT)
             i_exc = np.asarray(self.spikeMonExcI)
             y_exc = np.array([neuron_to_display[i] for i in i_exc])
-            colors_exc = np.array(['C3' if i in cs_set else ('C0' if i in us_set else '0.6') for i in i_exc])
-
-            ax.scatter(t_exc, y_exc, c=colors_exc, s=1, marker='.', linewidths=0)
+            ax.scatter(t_exc, y_exc, c='blue', s=1, marker='.', linewidths=0)
             ax.axhline(nCS - 0.5, color='k', lw=0.5, linestyle='-')
             ax.axhline(nCS + nUS - 0.5, color='k', lw=0.5, linestyle='-')
-            # Inhibitory combined below excitatory
             ax.scatter(self.spikeMonInhT, nExc + self.spikeMonInhI, s=1, c='red', marker='.', linewidths=0)
             ax.axhline(nExc - 0.5, color='k', lw=0.5, linestyle='-')
             ax.set_ylim(-0.5, self.p['nUnits'] - 0.5)
@@ -256,28 +211,20 @@ class SimpleResults:
             ax.scatter(self.spikeMonInhT, nExc + self.spikeMonInhI, s=1, c='red', marker='.', linewidths=0)
             ax.set_ylim(-0.5, self.p['nUnits'] - 0.5)
             ax.set_ylabel("Neuron index")
-
         ax.set_xlim(0, self.duration)
         ax.set_xlabel("Time (s)")
 
-    # -------------------------------------------------
-    # Firing rate
-    # -------------------------------------------------
     def plot_firing_rate(self, ax, bin_size=5*ms, show_upstate=True,
                          upstate_bin_size=10*ms, p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0):
-
         bin_size_s = float(bin_size / second)
         bins = np.arange(0, self.duration, bin_size_s)
         centers = bins[:-1] + bin_size_s / 2
         nExc = self.p['nExc']
         nInh = self.p['nInh']
-
         drew_upstate_span = False
         if show_upstate:
-            _, upstate_mask = self.detect_upstates(
-                bin_size=upstate_bin_size, use_exc_only=True,
-                p_stay=p_stay, rate_up_ratio=rate_up_ratio, rate_down_ratio=rate_down_ratio
-            )
+            _, upstate_mask = detect_upstates(self, bin_size=upstate_bin_size, use_exc_only=True,
+                                              p_stay=p_stay, rate_up_ratio=rate_up_ratio, rate_down_ratio=rate_down_ratio)
             first_span = True
             upstate_bin_size_s = float(upstate_bin_size / second)
             i = 0
@@ -295,7 +242,6 @@ class SimpleResults:
                 first_span = False
                 drew_upstate_span = True
 
-        # Firing rate by group: CS, US, other exc, inh (if CS/US defined); else exc + inh
         if 'cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p:
             cs_set = set(self.p['cs_neuron_inds'])
             us_set = set(self.p['us_neuron_inds'])
@@ -336,28 +282,208 @@ class SimpleResults:
         if (show_upstate and drew_upstate_span) or ('cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p):
             ax.legend(loc='upper right', fontsize=7)
 
-    # -------------------------------------------------
-    # Voltage trace
-    # -------------------------------------------------
-    def plot_voltage(self, ax, unitType='Exc', neuron_index=0, mean=False):
-        """
-        Plot voltage trace. If mean=True, plot mean voltage over all recorded neurons
-        (ignores neuron_index). Otherwise plot the trace for the given neuron_index.
-        """
+    def plot_voltage(self, ax, unitType='Exc', neuron_index=0, mean=False,
+                    spike_peak_mV=0.0):
         if unitType == 'Exc':
             V = np.asarray(self.stateMonExcV)
             color = 'cyan'
+            spike_times = np.asarray(self.spikeMonExcT)[self.spikeMonExcI == neuron_index]
+            thresh = float(self.p.get('vThreshExc', -52) / mV) if 'vThreshExc' in self.p else -52
         else:
             V = np.asarray(self.stateMonInhV)
             color = 'red'
-
+            spike_times = np.asarray(self.spikeMonInhT)[self.spikeMonInhI == neuron_index]
+            thresh = float(self.p.get('vThreshInh', -43) / mV) if 'vThreshInh' in self.p else -43
         if mean:
             v = V.mean(axis=0)
             lw = 0.8
         else:
             v = V[neuron_index]
             lw = 0.6
-
         ax.plot(self.stateMonT, v, color=color, lw=lw)
+        # Draw vertical spike markers for single-neuron trace
+        if not mean and len(spike_times) > 0:
+            for t in spike_times:
+                ax.plot([t, t], [thresh, spike_peak_mV], color=color, lw=0.8, solid_capstyle='butt')
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Voltage (mV)")
+
+    def plot_voltage_by_groups(self, ax=None, use_sem=True):
+        """Plot mean voltage ± error (SEM or SD) for each group (CS, US, other exc, inh) on one axes."""
+        V_exc = np.asarray(self.stateMonExcV)
+        V_inh = np.asarray(self.stateMonInhV)
+        t = self.stateMonT
+        if ax is None:
+            fig, ax = plt.subplots()
+
+        def plot_group(inds, V, color, label):
+            if len(inds) == 0:
+                return
+            sub = V[inds]
+            mean = sub.mean(axis=0)
+            n = sub.shape[0]
+            err = sub.std(axis=0) / (np.sqrt(n) if use_sem else 1.0) if n > 1 else np.zeros_like(mean)
+            ax.plot(t, mean, color=color, lw=0.8, label=label)
+            ax.fill_between(t, mean - err, mean + err, color=color, alpha=0.3)
+
+        if 'cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p:
+            cs_inds = self.p['cs_neuron_inds']
+            us_inds = self.p['us_neuron_inds']
+            nExc = self.p['nExc']
+            other_inds = np.array([i for i in range(nExc) if i not in cs_inds and i not in us_inds])
+            plot_group(cs_inds, V_exc, 'C3', 'CS')
+            plot_group(us_inds, V_exc, 'C0', 'US')
+            plot_group(other_inds, V_exc, '0.6', 'other exc')
+            plot_group(np.arange(V_inh.shape[0]), V_inh, 'red', 'inh')
+        else:
+            plot_group(np.arange(V_exc.shape[0]), V_exc, 'cyan', 'exc')
+            plot_group(np.arange(V_inh.shape[0]), V_inh, 'red', 'inh')
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Voltage (mV)")
+        ax.legend(loc='upper right', fontsize=7)
+        return ax
+
+    def plot_pca_3d_time_color(self, ax=None, bin_size=5*ms, use_exc_only=True,
+                               use_upstate_only=True, upstate_bin_size=10*ms,
+                               p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0,
+                               line_alpha=0.85, line_lw=0.8, cmap='viridis'):
+        bin_size_s = float(bin_size / second)
+        bins = np.arange(0, self.duration, bin_size_s)
+        centers = bins[:-1] + bin_size_s / 2
+        X = compute_population_matrix(self, bin_size, use_exc_only, subtract_mean=False)
+
+        if use_upstate_only:
+            _, upstate_mask_coarse = detect_upstates(self, bin_size=upstate_bin_size, use_exc_only=use_exc_only,
+                                                     p_stay=p_stay, rate_up_ratio=rate_up_ratio, rate_down_ratio=rate_down_ratio)
+            upstate_bin_size_s = float(upstate_bin_size / second)
+            upstate_mask = np.zeros(len(centers), dtype=bool)
+            for i in range(len(centers)):
+                k = min(int(centers[i] / upstate_bin_size_s), len(upstate_mask_coarse) - 1)
+                if k >= 0:
+                    upstate_mask[i] = upstate_mask_coarse[k]
+            X_use = X[upstate_mask] - X[upstate_mask].mean(axis=0)
+            centers_use = centers[upstate_mask]
+            if X_use.shape[0] < 2:
+                if ax is None:
+                    fig, ax = plt.subplots(subplot_kw=dict(projection='3d'))
+                ax.set_title("First 3 PCs (upstate only; no upstate bins)")
+                return ax
+        else:
+            X_use = X - X.mean(axis=0)
+            centers_use = centers
+
+        U, S, Vt = np.linalg.svd(X_use, full_matrices=False)
+        proj = X_use @ Vt[:3].T
+        for j in range(3):
+            col = proj[:, j]
+            proj[:, j] = (col - col.mean()) / (col.std() + 1e-10)
+        pc1, pc2, pc3 = proj[:, 0], proj[:, 1], proj[:, 2]
+        t_plot = centers_use
+
+        if ax is None:
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection='3d')
+        norm = Normalize(vmin=t_plot.min(), vmax=t_plot.max())
+        for i in range(len(pc1) - 1):
+            c = plt.get_cmap(cmap)(norm((t_plot[i] + t_plot[i + 1]) / 2))
+            ax.plot(pc1[i:i+2], pc2[i:i+2], pc3[i:i+2], color=c, alpha=line_alpha, lw=line_lw)
+        sm = cm.ScalarMappable(norm=norm, cmap=plt.get_cmap(cmap))
+        sm.set_array([])
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_zlabel("PC3")
+        ax.set_title("First 3 PCs (upstate only)" if use_upstate_only else "First 3 PCs (full simulation)")
+        plt.colorbar(sm, ax=ax, shrink=0.6, label="Time (s)")
+        return ax
+
+    def plot_within_between_correlations(self, ax=None, bin_size=5*ms):
+        cor = compute_within_between_correlations(self, bin_size)
+        if ax is None:
+            fig, ax = plt.subplots()
+        if cor is None:
+            ax.set_title("Within / between correlation (CS/US not defined)")
+            return ax
+        labels = ['within CS', 'within US', 'within other', 'between CS–US', 'between CS–other', 'between US–other']
+        values = [cor['within_CS'], cor['within_US'], cor['within_other'],
+                  cor['between_CS_US'], cor['between_CS_other'], cor['between_US_other']]
+        colors = ['C3', 'C0', '0.6', 'purple', 'brown', 'green']
+        x = np.arange(len(labels))
+        ax.bar(x, values, color=colors)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=30, ha='right')
+        ax.set_ylabel("Mean correlation")
+        ax.set_title("Within vs between group correlation (exc)")
+        return ax
+
+    def plot_pca_variance(self, ax=None, bin_size=5*ms, use_exc_only=True,
+                         use_upstate_only=False, upstate_bin_size=10*ms,
+                         p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0,
+                         max_components=50, bar=True):
+        var_pct = compute_pca_variance_explained(
+            self, bin_size, use_exc_only, use_upstate_only, upstate_bin_size,
+            p_stay, rate_up_ratio, rate_down_ratio
+        )
+        n_show = min(max_components, len(var_pct))
+        var_pct = var_pct[:n_show]
+        if ax is None:
+            fig, ax = plt.subplots()
+        x = np.arange(1, len(var_pct) + 1)
+        if bar:
+            ax.bar(x, var_pct, color='steelblue', alpha=0.8, edgecolor='navy')
+        else:
+            ax.plot(x, var_pct, 'o-', color='steelblue', markersize=3)
+        ax.set_xlabel("Principal component")
+        ax.set_ylabel("Variance explained (%)")
+        title = "PCA variance explained (upstate only)" if use_upstate_only else "PCA variance explained (full)"
+        ax.set_title(title)
+        return ax
+
+    def plot_weight_matrices(self, ax_pre=None, ax_post=None, cbar_label="Weight (pA)"):
+        """
+        Plot pre- and post-simulation weight matrices from params (stored in results).
+        Expects self.p['weight_matrix_pre'], self.p['weight_matrix_post'], self.p['nExc'], self.p['nInh'].
+        Returns the figure if one was created, else None.
+        """
+        if 'weight_matrix_pre' not in self.p or 'weight_matrix_post' not in self.p:
+            return None
+        W_pre = np.asarray(self.p['weight_matrix_pre'])
+        W_post = np.asarray(self.p['weight_matrix_post'])
+        nExc = self.p['nExc']
+        nInh = self.p['nInh']
+        nUnits = nExc + nInh
+        # Scale colors by the range of non-zero weights so variation in 200–360 is visible
+        all_nonzero = np.concatenate([W_pre[W_pre > 0].ravel(), W_post[W_post > 0].ravel()])
+        if len(all_nonzero) > 0:
+            vmin = float(np.min(all_nonzero))
+            vmax = float(np.max(all_nonzero))
+        else:
+            vmin, vmax = 0.0, 1.0
+
+        if ax_pre is None and ax_post is None:
+            fig = plt.figure(figsize=(12, 5.5))
+            ax_pre = fig.add_subplot(1, 2, 1)
+            ax_post = fig.add_subplot(1, 2, 2)
+            created_fig = fig
+        else:
+            created_fig = None
+
+        def _draw_matrix(ax, W, title):
+            im = ax.imshow(W, aspect='equal', interpolation='nearest', cmap='viridis',
+                           origin='lower', vmin=vmin, vmax=vmax)
+            ax.set_xlabel("Presynaptic neuron (E | I)")
+            ax.set_ylabel("Postsynaptic neuron (E | I)")
+            ax.axhline(nExc - 0.5, color='white', lw=0.5)
+            ax.axvline(nExc - 0.5, color='white', lw=0.5)
+            ax.set_xticks([nExc // 2, nExc + nInh // 2])
+            ax.set_xticklabels(['E', 'I'])
+            ax.set_yticks([nExc // 2, nExc + nInh // 2])
+            ax.set_yticklabels(['E', 'I'])
+            ax.set_title(title)
+            return im
+
+        im1 = _draw_matrix(ax_pre, W_pre, "Weights (pre-simulation)")
+        im2 = _draw_matrix(ax_post, W_post, "Weights (post-simulation)")
+        plt.colorbar(im1, ax=ax_pre, label=cbar_label)
+        plt.colorbar(im2, ax=ax_post, label=cbar_label)
+        return created_fig
+

@@ -3,6 +3,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from plotting import SimpleResults
+from utils import (
+    trial_duration,
+    pulse_times_train,
+    adjacency_indices_within,
+    adjacency_indices_between,
+    normal_weights,
+)
 
 rng_seed = 42
 seed(rng_seed)
@@ -13,7 +20,6 @@ rng = np.random.default_rng(rng_seed)
 # Parameters
 # =============================
 params = {
-    'nTrials': 3,
     'dt': 0.1 * ms,
 
     'reportType': 'stdout',
@@ -21,10 +27,12 @@ params = {
     'doProfile': True,
 
     # CS-US training (red = CS, blue = US; paper: 440 ms red @ 25 Hz, 80 ms blue @ 50 Hz)
+    'nTrials': 1,
     'ISI': 360 * ms,              # time from CS onset to US onset (inter-stimulus interval)
     'propCS': 0.05,               # fraction of excitatory neurons selected for CS (red)
     'propUS': 0.05,               # fraction of excitatory neurons selected for US (blue)
     'interTrialInterval': 2 * second,
+    'include_CS_only_trial': True,  # if True, add one extra trial with CS only (no US)
     'CS_train_duration': 440 * ms,
     'CS_Hz': 25 * Hz,
     'US_train_duration': 80 * ms,
@@ -71,13 +79,10 @@ params = {
 }
 
 # Derive duration from trial setup (no single duration param)
-def _trial_duration(p):
-    return max(float(p['CS_train_duration'] / second),
-               float((p['ISI'] + p['US_train_duration']) / second))
-
-params['trialDuration'] = _trial_duration(params) * second
+params['trialDuration'] = trial_duration(params) * second
 params['trialPeriod'] = params['trialDuration'] + params['interTrialInterval']  # time from one trial start to next
-params['duration'] = (params['nTrials'] * float(params['trialPeriod'] / second) -
+n_trials_total = params['nTrials'] + (1 if params.get('include_CS_only_trial', False) else 0)
+params['duration'] = (n_trials_total * float(params['trialPeriod'] / second) -
                       float(params['interTrialInterval'] / second) + 0.5) * second
 
 defaultclock.dt = params['dt']
@@ -164,31 +169,25 @@ unitsInh.gl = params['gLeakInh']
 # =============================
 nCS = max(1, int(round(params['propCS'] * params['nExc'])))
 nUS = max(1, int(round(params['propUS'] * params['nExc'])))
-cs_neuron_inds = rng.choice(params['nExc'], size=nCS, replace=False)
-us_neuron_inds = rng.choice(params['nExc'], size=nUS, replace=False)
+# Contiguous blocks: CS = [0, nCS), US = [nCS, nCS+nUS), other = [nCS+nUS, nExc)
+nUS = min(nUS, params['nExc'] - nCS)  # keep CS+US within nExc
+cs_neuron_inds = np.arange(0, nCS)
+us_neuron_inds = np.arange(nCS, nCS + nUS)
 params['cs_neuron_inds'] = cs_neuron_inds
 params['us_neuron_inds'] = us_neuron_inds
 
-def _pulse_times_train(trial_starts_s, train_duration_s, freq_Hz, dt_s=0.0001):
-    """For each trial start, generate pulse times at freq_Hz for train_duration_s."""
-    period_s = 1.0 / float(freq_Hz)
-    times = []
-    for t0 in trial_starts_s:
-        t = 0.0
-        while t < train_duration_s:
-            times.append(t0 + t)
-            t += period_s
-    return np.array(times)
+trial_starts_s = np.array([tr * float(params['trialPeriod'] / second) for tr in range(n_trials_total)])
 
-trial_starts_s = np.array([tr * float(params['trialPeriod'] / second) for tr in range(params['nTrials'])])
-
-cs_times_s = _pulse_times_train(
+# CS on all trials (including optional CS-only trial)
+cs_times_s = pulse_times_train(
     trial_starts_s,
     float(params['CS_train_duration'] / second),
     float(params['CS_Hz'] / Hz),
 )
-us_times_s = _pulse_times_train(
-    trial_starts_s + float(params['ISI'] / second),
+# US only on paired trials (exclude the optional CS-only trial)
+trial_starts_for_US = trial_starts_s[:params['nTrials']]
+us_times_s = pulse_times_train(
+    trial_starts_for_US + float(params['ISI'] / second),
     float(params['US_train_duration'] / second),
     float(params['US_Hz'] / Hz),
 )
@@ -210,53 +209,6 @@ syn_US.connect(i=np.arange(nUS), j=us_neuron_inds)
 # =============================
 # Recurrent synapses
 # =============================
-def adjacency_indices_within(nUnits, pConn):
-    bestNumberOfSynapses = int(np.round(pConn * nUnits ** 2))
-
-    probabilityArray = np.full((nUnits, nUnits), 1 / (nUnits * (nUnits - 1)))
-    probabilityArray[np.diag_indices_from(probabilityArray)] = 0
-
-    if pConn > (nUnits - 1) / nUnits:
-        bestNumberOfSynapses -= int(np.round(nUnits ** 2 * (pConn - (nUnits - 1) / nUnits)))
-
-    indicesFlat = rng.choice(nUnits ** 2, bestNumberOfSynapses, replace=False, p=probabilityArray.ravel())
-
-    preInds, postInds = np.unravel_index(indicesFlat, (nUnits, nUnits))
-    return preInds, postInds
-
-def adjacency_indices_between(nUnitsPre, nUnitsPost, pConn):
-    bestNumberOfSynapses = int(np.round(pConn * nUnitsPre * nUnitsPost))
-    indicesFlat = rng.choice(nUnitsPre * nUnitsPost, bestNumberOfSynapses, replace=False)
-
-    preInds, postInds = np.unravel_index(indicesFlat, (nUnitsPre, nUnitsPost))
-
-    return preInds, postInds
-
-def normal_weights(mean_current, syn):
-    n = len(syn)
-
-    # Extract the unit
-    unit = get_unit(mean_current.dimensions)
-
-    # Convert mean to dimensionless value
-    mean_value = float(mean_current / unit)
-
-    std_value = params['weightCV'] * mean_value
-
-    # Sample dimensionless numbers
-    weights = np.random.normal(
-        loc=mean_value,
-        scale=std_value,
-        size=n
-    )
-
-    # Prevent negative weights
-    weights = np.clip(weights, 0, None)
-
-    # Re-attach unit
-    return weights * unit
-
-
 tauRiseEOverMS = params['tauRiseExc'] / ms
 tauRiseIOverMS = params['tauRiseInh'] / ms
 
@@ -267,11 +219,11 @@ synapsesEE = Synapses(
     target=unitsExc,
     on_pre='uE_post += jEE / tauRiseEOverMS',  # 'uE_post += 1 / tauRiseEOverMS'
 )
-preInds, postInds = adjacency_indices_within(params['nExc'], params['propConnect'])
+preInds, postInds = adjacency_indices_within(params['nExc'], params['propConnect'], rng)
 synapsesEE.connect(i=preInds, j=postInds)
 paramsreEE = preInds
 paramsosEE = postInds
-synapsesEE.jEE = normal_weights(params['jEE'], synapsesEE)
+synapsesEE.jEE = normal_weights(params['jEE'], len(synapsesEE), params['weightCV'], rng)
 
 # from E to I
 synapsesEI = Synapses(
@@ -280,11 +232,11 @@ synapsesEI = Synapses(
     target=unitsExc,
     on_pre='uI_post += jEI / tauRiseIOverMS',
 )
-preInds, postInds = adjacency_indices_between(params['nInh'], params['nExc'], params['propConnect'])
+preInds, postInds = adjacency_indices_between(params['nInh'], params['nExc'], params['propConnect'], rng)
 synapsesEI.connect(i=preInds, j=postInds)
 paramsreEI = preInds
 paramsosEI = postInds
-synapsesEI.jEI = normal_weights(params['jEI'], synapsesEI)
+synapsesEI.jEI = normal_weights(params['jEI'], len(synapsesEI), params['weightCV'], rng)
 
 # from I to E
 synapsesIE = Synapses(
@@ -293,11 +245,11 @@ synapsesIE = Synapses(
     target=unitsInh,
     on_pre='uE_post += jIE / tauRiseEOverMS',
 )
-preInds, postInds = adjacency_indices_between(params['nExc'], params['nInh'], params['propConnect'])
+preInds, postInds = adjacency_indices_between(params['nExc'], params['nInh'], params['propConnect'], rng)
 synapsesIE.connect(i=preInds, j=postInds)
 paramsreIE = preInds
 paramsosIE = postInds
-synapsesIE.jIE = normal_weights(params['jIE'], synapsesIE)
+synapsesIE.jIE = normal_weights(params['jIE'], len(synapsesIE), params['weightCV'], rng)
 
 # from I to I
 synapsesII = Synapses(
@@ -306,11 +258,11 @@ synapsesII = Synapses(
     target=unitsInh,
     on_pre='uI_post += jII / tauRiseIOverMS',
 )
-preInds, postInds = adjacency_indices_within(params['nInh'], params['propConnect'])
+preInds, postInds = adjacency_indices_within(params['nInh'], params['propConnect'], rng)
 synapsesII.connect(i=preInds, j=postInds)
 paramsreII = preInds
 paramsosII = postInds
-synapsesII.jII = normal_weights(params['jII'], synapsesII)
+synapsesII.jII = normal_weights(params['jII'], len(synapsesII), params['weightCV'], rng)
 
 synapsesEE.delay = ((rng.random(synapsesEE.delay.shape[0]) * params['delayExc'] /
                      defaultclock.dt).astype(int) + 1) * defaultclock.dt
@@ -322,59 +274,35 @@ synapsesII.delay = ((rng.random(synapsesII.delay.shape[0]) * params['delayInh'] 
                      defaultclock.dt).astype(int) + 1) * defaultclock.dt
 
 
-def log_synapse_stats(name, syn, varname):
-    # Get weights
-    w = getattr(syn, varname)[:]
+def build_weight_matrix(syn_EE, syn_EI, syn_IE, syn_II, nExc, nInh):
+    """
+    Build full weight matrix W (nUnits x nUnits), W[post, pre] = weight from pre to post.
+    Unconnected pairs are 0. Returns matrix in same units as synapse weights (stripped to float).
+    """
+    nUnits = nExc + nInh
+    W = np.zeros((nUnits, nUnits))
 
-    # Convert to numpy array and strip units
-    w = np.array(w)
-    if hasattr(w, 'unit'):
-        w = w / w.unit
+    def set_weights(syn, varname, post_offset=0, pre_offset=0):
+        pre = np.asarray(syn.i)
+        post = np.asarray(syn.j)
+        w = np.asarray(getattr(syn, varname)[:])
+        if hasattr(w, 'unit'):
+            w = np.asarray(w / w.unit)
+        for k in range(len(w)):
+            W[post_offset + post[k], pre_offset + pre[k]] = float(w[k])
 
-    print(f"\n{name} synapse weight stats ({varname}):")
-    print(f"  Count: {w.size}")
-    print(f"  Mean:  {np.mean(w):.6e}")
-    print(f"  Std:   {np.std(w):.6e}")
-    print(f"  Min:   {np.min(w):.6e}")
-    print(f"  Max:   {np.max(w):.6e}")
-
-
-def log_incoming_strength(name, syn, varname, n_post):
-    # Get weights and indices
-    weights = np.array(getattr(syn, varname)[:])
-    post_inds = np.array(syn.j[:])  # postsynaptic indices
-
-    # Strip units if present
-    if hasattr(weights, 'unit'):
-        weights = weights / weights.unit
-
-    # Accumulate total incoming weight per postsyn neuron
-    total_incoming = np.zeros(n_post)
-    np.add.at(total_incoming, post_inds, weights)
-
-    print(f"\n{name} incoming total synaptic strength per neuron:")
-    print(f"  Mean: {np.mean(total_incoming):.6e}")
-    print(f"  Std:  {np.std(total_incoming):.6e}")
-    print(f"  Min:  {np.min(total_incoming):.6e}")
-    print(f"  Max:  {np.max(total_incoming):.6e}")
-
-    # Also compute in-degree
-    indegree = np.zeros(n_post)
-    np.add.at(indegree, post_inds, 1)
-
-    print(f"  Mean in-degree: {np.mean(indegree):.2f}")
-    print(f"  Std in-degree:  {np.std(indegree):.2f}")
+    set_weights(syn_EE, 'jEE', 0, 0)           # E -> E
+    set_weights(syn_EI, 'jEI', 0, nExc)        # I -> E (pre is inh)
+    set_weights(syn_IE, 'jIE', nExc, 0)        # E -> I (post is inh)
+    set_weights(syn_II, 'jII', nExc, nExc)     # I -> I
+    return W
 
 
-log_synapse_stats("EE", synapsesEE, "jEE")
-log_synapse_stats("EI", synapsesEI, "jEI")
-log_synapse_stats("IE", synapsesIE, "jIE")
-log_synapse_stats("II", synapsesII, "jII")
-
-log_incoming_strength("EE", synapsesEE, "jEE", len(unitsExc))
-log_incoming_strength("EI", synapsesEI, "jEI", len(unitsExc))
-log_incoming_strength("IE", synapsesIE, "jIE", len(unitsInh))
-log_incoming_strength("II", synapsesII, "jII", len(unitsInh))
+# Store pre-simulation weight matrix in params
+params['weight_matrix_pre'] = build_weight_matrix(
+    synapsesEE, synapsesEI, synapsesIE, synapsesII,
+    params['nExc'], params['nInh']
+)
 
 # =============================
 # Monitors
@@ -399,6 +327,12 @@ tauAdapt = params['adaptTau']
 
 run(params['duration'], report=params['reportType'], report_period=params['reportPeriod'], profile=params['doProfile'])
 
+# Store post-simulation weight matrix in params
+params['weight_matrix_post'] = build_weight_matrix(
+    synapsesEE, synapsesEI, synapsesIE, synapsesII,
+    params['nExc'], params['nInh']
+)
+
 # =============================
 # Plots
 # =============================
@@ -411,24 +345,31 @@ results = SimpleResults(
 )
 
 
-fig = plt.figure(figsize=(8, 12))
-ax_raster = fig.add_subplot(4, 1, 1)
-ax_rate = fig.add_subplot(4, 1, 2)
-ax_voltage = fig.add_subplot(4, 1, 3)
-ax_pca = fig.add_subplot(4, 1, 4, projection='3d')
-
-# Raster (excitatory CS | US | other, then inhibitory)
+# Figure 1: raster, firing rate, voltage (mean per group ± SEM)
+fig1 = plt.figure(figsize=(8, 10))
+ax_raster = fig1.add_subplot(3, 1, 1)
+ax_rate = fig1.add_subplot(3, 1, 2)
+ax_voltage = fig1.add_subplot(3, 1, 3)
 results.plot_spike_raster(ax_raster)
-
-# Firing rate
 results.plot_firing_rate(ax_rate)
+results.plot_voltage_by_groups(ax_voltage)
+fig1.tight_layout()
 
-# Voltage trace
-results.plot_voltage(ax_voltage, unitType='Exc', neuron_index=0, mean=False)
+# Figure 2: PCA 3D (scaled up), within/between correlation, PCA variance
+fig2 = plt.figure(figsize=(10, 12))
+gs = fig2.add_gridspec(3, 1, height_ratios=[2, 1, 1])  # 3D plot gets 2x height
+ax_pca = fig2.add_subplot(gs[0], projection='3d')
+ax_corr = fig2.add_subplot(gs[1])
+ax_var = fig2.add_subplot(gs[2])
 
-# PCA: first 3 components with time as color
-results.plot_pca_3d_time_color(ax=ax_pca, use_upstate_only=False)
+results.plot_pca_3d_time_color(ax=ax_pca, use_upstate_only=True)
+results.plot_within_between_correlations(ax=ax_corr)
+results.plot_pca_variance(ax=ax_var, use_upstate_only=True)
+fig2.tight_layout()
 
+# Figure 3: pre- and post-simulation weight matrices (from results/params)
+fig3 = results.plot_weight_matrices()
+if fig3 is not None:
+    fig3.tight_layout()
 
-plt.tight_layout()
 plt.show()
