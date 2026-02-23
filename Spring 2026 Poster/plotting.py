@@ -165,6 +165,47 @@ def compute_pca_variance_explained(results, bin_size=5*ms, use_exc_only=True,
     return var_explained * 100
 
 
+def compute_block_weight_change(W_pre, W_post, groups, group_names=None):
+    """
+    Block-averaged weight change: for each (post, pre) group pair, compute mean and SEM
+    of percentage change (W_post - W_pre) / W_pre * 100 over synapses with W_pre > 0.
+
+    groups: 1d array of length N, group index per neuron (0=CS, 1=US, 2=other, etc.)
+    group_names: optional list of names for labels (e.g. ['CS', 'US', 'other'])
+    Returns: labels (e.g. ['CS→CS', 'CS→US', ...]), means (%), sems (%).
+    """
+    W_pre = np.asarray(W_pre)
+    W_post = np.asarray(W_post)
+    groups = np.asarray(groups)
+    unique = np.unique(groups)
+    if group_names is None:
+        group_names = [str(g) for g in unique]
+    else:
+        group_names = [group_names[i] for i in range(len(unique))]
+    labels = []
+    means = []
+    sems = []
+    for i_post, g_post in enumerate(unique):
+        for i_pre, g_pre in enumerate(unique):
+            mask_post = (groups == g_post)
+            mask_pre = (groups == g_pre)
+            w_pre_b = W_pre[np.ix_(mask_post, mask_pre)].ravel()
+            w_post_b = W_post[np.ix_(mask_post, mask_pre)].ravel()
+            valid = w_pre_b > 0
+            if np.sum(valid) == 0:
+                means.append(np.nan)
+                sems.append(np.nan)
+            else:
+                w_pre_v = w_pre_b[valid]
+                w_post_v = w_post_b[valid]
+                pct = (w_post_v - w_pre_v) / w_pre_v * 100.0
+                means.append(float(np.mean(pct)))
+                n = len(pct)
+                sems.append(float(np.std(pct) / np.sqrt(n)) if n > 1 else 0.0)
+            labels.append(f"{group_names[i_post]}→{group_names[i_pre]}")
+    return labels, np.array(means), np.array(sems)
+
+
 # ---------------------------------------------------------------------------
 # SimpleResults: data container + plotting only
 # ---------------------------------------------------------------------------
@@ -356,6 +397,11 @@ class SimpleResults:
         else:
             plot_group(rec_exc, V_exc, rec_exc, 'cyan', 'exc')
             plot_group(rec_inh, V_inh, rec_inh, 'red', 'inh')
+        # Mark times when US would have started on CS-only trials (no US delivered)
+        us_omit = self.p.get('us_omit_times_s')
+        if us_omit is not None and len(us_omit) > 0:
+            for t in np.atleast_1d(us_omit):
+                ax.axvline(t, color='C0', linestyle='--', alpha=0.7, linewidth=0.8)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Voltage (mV)")
         ax.legend(loc='upper right', fontsize=7)
@@ -456,52 +502,46 @@ class SimpleResults:
         ax.set_title(title)
         return ax
 
-    def plot_weight_matrices(self, ax_pre=None, ax_post=None, cbar_label="Weight (pA)"):
+    def plot_weight_change_blocks(self, ax=None):
         """
-        Plot pre- and post-simulation weight matrices from params (stored in results).
-        Expects self.p['weight_matrix_pre'], self.p['weight_matrix_post'], self.p['nExc'], self.p['nInh'].
+        Bar graph of mean ± SEM percentage weight change by block (CS→CS, CS→US, US→CS, US→US, etc.)
+        Uses EE block only with groups CS, US, other. Requires weight_matrix_pre/post and cs/us_neuron_inds.
         Returns the figure if one was created, else None.
         """
         if 'weight_matrix_pre' not in self.p or 'weight_matrix_post' not in self.p:
             return None
+        if 'cs_neuron_inds' not in self.p or 'us_neuron_inds' not in self.p:
+            return None
         W_pre = np.asarray(self.p['weight_matrix_pre'])
         W_post = np.asarray(self.p['weight_matrix_post'])
         nExc = self.p['nExc']
-        nInh = self.p['nInh']
-        nUnits = nExc + nInh
-        # Scale colors by the range of non-zero weights so variation in 200–360 is visible
-        all_nonzero = np.concatenate([W_pre[W_pre > 0].ravel(), W_post[W_post > 0].ravel()])
-        if len(all_nonzero) > 0:
-            vmin = float(np.min(all_nonzero))
-            vmax = float(np.max(all_nonzero))
-        else:
-            vmin, vmax = 0.0, 1.0
-
-        if ax_pre is None and ax_post is None:
-            fig = plt.figure(figsize=(12, 5.5))
-            ax_pre = fig.add_subplot(1, 2, 1)
-            ax_post = fig.add_subplot(1, 2, 2)
+        # EE block only
+        W_pre_EE = W_pre[:nExc, :nExc]
+        W_post_EE = W_post[:nExc, :nExc]
+        cs_inds = np.atleast_1d(self.p['cs_neuron_inds'])
+        us_inds = np.atleast_1d(self.p['us_neuron_inds'])
+        other_inds = np.array([i for i in range(nExc) if i not in cs_inds and i not in us_inds])
+        groups = np.zeros(nExc, dtype=int)
+        groups[cs_inds] = 0
+        groups[us_inds] = 1
+        groups[other_inds] = 2
+        group_names = ['CS', 'US', 'other']
+        labels, means, sems = compute_block_weight_change(
+            W_pre_EE, W_post_EE, groups, group_names=group_names
+        )
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(10, 5))
             created_fig = fig
         else:
             created_fig = None
-
-        def _draw_matrix(ax, W, title):
-            im = ax.imshow(W, aspect='equal', interpolation='nearest', cmap='viridis',
-                           origin='lower', vmin=vmin, vmax=vmax)
-            ax.set_xlabel("Presynaptic neuron (E | I)")
-            ax.set_ylabel("Postsynaptic neuron (E | I)")
-            ax.axhline(nExc - 0.5, color='white', lw=0.5)
-            ax.axvline(nExc - 0.5, color='white', lw=0.5)
-            ax.set_xticks([nExc // 2, nExc + nInh // 2])
-            ax.set_xticklabels(['E', 'I'])
-            ax.set_yticks([nExc // 2, nExc + nInh // 2])
-            ax.set_yticklabels(['E', 'I'])
-            ax.set_title(title)
-            return im
-
-        im1 = _draw_matrix(ax_pre, W_pre, "Weights (pre-simulation)")
-        im2 = _draw_matrix(ax_post, W_post, "Weights (post-simulation)")
-        plt.colorbar(im1, ax=ax_pre, label=cbar_label)
-        plt.colorbar(im2, ax=ax_post, label=cbar_label)
+        x = np.arange(len(labels))
+        colors = ['C3', 'C0', '0.6']
+        bar_colors = [colors[i // 3] if i // 3 < 3 else 'gray' for i in range(len(labels))]
+        ax.bar(x, means, yerr=sems, capsize=4, color=bar_colors, alpha=0.85, edgecolor='black', linewidth=0.5)
+        ax.axhline(0, color='black', linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=30, ha='right')
+        ax.set_ylabel("Weight change (%)")
+        ax.set_title("EE weight change by block (mean ± SEM)")
         return created_fig
 

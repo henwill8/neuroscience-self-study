@@ -27,12 +27,13 @@ params = {
     'doProfile': True,
 
     # CS-US training (red = CS, blue = US; paper: 440 ms red @ 25 Hz, 80 ms blue @ 50 Hz)
-    'nTrials': 10,
+    'nTrials': 1,
     'ISI': 360 * ms,              # time from CS onset to US onset (inter-stimulus interval)
     'propCS': 0.05,               # fraction of excitatory neurons selected for CS (red)
     'propUS': 0.05,               # fraction of excitatory neurons selected for US (blue)
     'interTrialInterval': 2 * second,
-    'include_CS_only_trial': True,  # if True, add one extra trial with CS only (no US)
+    'include_CS_only_trial': False,  # if True, add one extra trial with CS only (no US)
+    'cs_only_every_n_trials': None,  # if int (e.g. 5), every nth trial is CS only (no US) to probe training
     'CS_train_duration': 440 * ms,
     'CS_Hz': 25 * Hz,
     'US_train_duration': 80 * ms,
@@ -190,19 +191,35 @@ params['us_neuron_inds'] = us_neuron_inds
 
 trial_starts_s = np.array([tr * float(params['trialPeriod'] / second) for tr in range(n_trials_total)])
 
-# CS on all trials (including optional CS-only trial)
+# CS on all trials
 cs_times_s = pulse_times_train(
     trial_starts_s,
     float(params['CS_train_duration'] / second),
     float(params['CS_Hz'] / Hz),
 )
-# US only on paired trials (exclude the optional CS-only trial)
-trial_starts_for_US = trial_starts_s[:params['nTrials']]
+# US only on paired trials: never on the optional extra CS-only trial; skip every nth if set
+n_trials_paired = params['nTrials']  # extra trial at end (if any) is always CS-only
+every_n = params.get('cs_only_every_n_trials')
+if every_n is not None and every_n >= 1:
+    # Trial i (0-indexed) is CS-only when (i+1) % every_n == 0
+    trial_inds_US = [i for i in range(n_trials_paired) if (i + 1) % every_n != 0]
+    trial_starts_for_US = trial_starts_s[trial_inds_US]
+else:
+    trial_starts_for_US = trial_starts_s[:n_trials_paired]
 us_times_s = pulse_times_train(
     trial_starts_for_US + float(params['ISI'] / second),
     float(params['US_train_duration'] / second),
     float(params['US_Hz'] / Hz),
 )
+
+# Times when US would have started on CS-only trials (for marking on voltage plot)
+ISI_s = float(params['ISI'] / second)
+cs_only_trial_inds = []
+if every_n is not None and every_n >= 1:
+    cs_only_trial_inds.extend([i for i in range(n_trials_paired) if (i + 1) % every_n == 0])
+if params.get('include_CS_only_trial', False) and n_trials_total > n_trials_paired:
+    cs_only_trial_inds.append(n_trials_paired)
+params['us_omit_times_s'] = np.array([trial_starts_s[i] + ISI_s for i in cs_only_trial_inds])
 
 # Expand to one spike per target neuron per pulse time
 cs_indices_src = np.repeat(np.arange(nCS), len(cs_times_s))
@@ -429,7 +446,7 @@ results.plot_pca_variance(ax=ax_var, use_upstate_only=True)
 fig2.tight_layout()
 
 # Figure 3: pre- and post-simulation weight matrices (from results/params)
-fig3 = results.plot_weight_matrices()
+fig3 = results.plot_weight_change_blocks()
 if fig3 is not None:
     fig3.tight_layout()
 
