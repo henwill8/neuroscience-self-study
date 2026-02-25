@@ -116,6 +116,8 @@ def compute_within_between_correlations(results, bin_size=5*ms):
     if 'cs_neuron_inds' not in results.p or 'us_neuron_inds' not in results.p:
         return None
     X = compute_population_matrix(results, bin_size, use_exc_only=True, subtract_mean=False)
+    if X.shape[0] < 2 or X.shape[1] < 2:
+        return {k: np.nan for k in ('within_CS', 'within_US', 'within_other', 'between_CS_US', 'between_CS_other', 'between_US_other')}
     R = np.corrcoef(X.T)
     nExc = results.p['nExc']
     cs_set = set(results.p['cs_neuron_inds'])
@@ -158,9 +160,13 @@ def compute_pca_variance_explained(results, bin_size=5*ms, use_exc_only=True,
             k = min(int(centers[i] / upstate_bin_size_s), len(upstate_mask_coarse) - 1)
             if k >= 0:
                 upstate_mask[i] = upstate_mask_coarse[k]
-        X = X[upstate_mask] - X[upstate_mask].mean(axis=0)
+        if np.any(upstate_mask):
+            X = X[upstate_mask] - X[upstate_mask].mean(axis=0)
+        # else X stays as-is; svd of empty will be handled below
     else:
         X = X - X.mean(axis=0)
+    if X.shape[0] < 2:
+        return np.full(3, np.nan)  # not enough data for variance explained
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
     var_explained = (S ** 2) / (S ** 2).sum()
     return var_explained * 100
@@ -317,11 +323,13 @@ class SimpleResults:
         self.spikeMonExcI = spikeMonExc.i
         self.spikeMonInhT = spikeMonInh.t / second
         self.spikeMonInhI = spikeMonInh.i
-        self.stateMonExcV = stateMonExc.v / mV
-        self.stateMonInhV = stateMonInh.v / mV
+        self.stateMonExcV = np.asarray(stateMonExc.v / mV)
+        self.stateMonInhV = np.asarray(stateMonInh.v / mV)
         self.stateDT = float(stateMonExc.clock.dt / second)
         self.duration = float(params['duration'] / second)
-        self.stateMonT = np.arange(0, self.duration, self.stateDT)
+        # Time axis: match length to recorded voltage (StateMonitor is neurons x time)
+        n_times = self.stateMonExcV.shape[1]
+        self.stateMonT = np.arange(n_times, dtype=float) * self.stateDT
 
     @classmethod
     def from_checkpoint(cls, filepath):
@@ -338,7 +346,8 @@ class SimpleResults:
         r.stateMonInhV = np.asarray(data['state_v_inh'])
         r.stateDT = float(data['state_dt'])
         r.duration = float(data['duration'])
-        r.stateMonT = np.arange(0, r.duration, r.stateDT)
+        n_times = r.stateMonExcV.shape[1]
+        r.stateMonT = np.arange(n_times, dtype=float) * r.stateDT
         return r
 
     def plot_spike_raster(self, ax):
@@ -488,6 +497,8 @@ class SimpleResults:
         rec_exc = np.atleast_1d(rec_exc)
         rec_inh = np.atleast_1d(rec_inh)
 
+        had_any = [False]  # use list so inner function can set it
+
         def plot_group(neuron_inds, V, record_inds, color, label):
             # Map neuron indices to row indices: row k in V corresponds to neuron record_inds[k]
             neuron_inds = np.atleast_1d(neuron_inds)
@@ -496,10 +507,13 @@ class SimpleResults:
                 return
             sub = V[row_inds]
             mean = sub.mean(axis=0)
+            if mean.size == 0 or len(mean) != len(t):
+                return
             n = sub.shape[0]
             err = sub.std(axis=0) / (np.sqrt(n) if use_sem else 1.0) if n > 1 else np.zeros_like(mean)
             ax.plot(t, mean, color=color, lw=0.8, label=label)
             ax.fill_between(t, mean - err, mean + err, color=color, alpha=0.3)
+            had_any[0] = True
 
         if 'cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p:
             cs_inds = np.atleast_1d(self.p['cs_neuron_inds'])
@@ -520,7 +534,8 @@ class SimpleResults:
                 ax.axvline(t, color='C0', linestyle='--', alpha=0.7, linewidth=0.8)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Voltage (mV)")
-        ax.legend(loc='upper right', fontsize=7)
+        if had_any[0]:
+            ax.legend(loc='upper right', fontsize=7)
         return ax
 
     def plot_pca_3d_time_color(self, ax=None, bin_size=5*ms, use_exc_only=True,
@@ -541,8 +556,12 @@ class SimpleResults:
                 k = min(int(centers[i] / upstate_bin_size_s), len(upstate_mask_coarse) - 1)
                 if k >= 0:
                     upstate_mask[i] = upstate_mask_coarse[k]
-            X_use = X[upstate_mask] - X[upstate_mask].mean(axis=0)
-            centers_use = centers[upstate_mask]
+            if not np.any(upstate_mask):
+                X_use = np.empty((0, X.shape[1]))
+                centers_use = np.array([])
+            else:
+                X_use = X[upstate_mask] - X[upstate_mask].mean(axis=0)
+                centers_use = centers[upstate_mask]
             if X_use.shape[0] < 2:
                 if ax is None:
                     fig, ax = plt.subplots(subplot_kw=dict(projection='3d'))

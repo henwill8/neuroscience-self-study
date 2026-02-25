@@ -109,8 +109,8 @@ def get_default_params():
         # Recording and checkpoint
         # -------------------------------------------------------------------------
         'n_record_voltage': 100,   # how many neurons per population to record (None = all)
-        'save_checkpoint': False,  # when True, save weights, params, and monitor data to pickle for later loading
-        'checkpoint_path': 'network_checkpoint.pkl',
+        'save_checkpoint': True,  # when True, save weights, params, and monitor data to pickle for later loading
+        'checkpoint_path': 'results/network_checkpoint.pkl',
     }
     derive_trial_params(params)
     return params

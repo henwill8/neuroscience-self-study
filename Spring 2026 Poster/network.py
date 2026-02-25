@@ -3,6 +3,7 @@ Network class: build units and synapses, run simulation, optionally save checkpo
 Run from command line or import and call Network(params, rng).run().
 """
 from brian2 import *
+from brian2.core.network import Network as B2Network
 import numpy as np
 
 from config import get_default_params
@@ -91,6 +92,16 @@ class Network:
         p['nInh'] = int(p['propInh'] * p['nUnits'])
         p['nExc'] = int(p['nUnits'] - p['nInh'])
 
+        # Namespace for neuron ODEs (tau*, noiseSigma, tauAdapt) so they resolve when using explicit Network
+        neuron_namespace = {
+            'tauRiseE': p['tauRiseExc'],
+            'tauFallE': p['tauFallExc'],
+            'tauRiseI': p['tauRiseInh'],
+            'tauFallI': p['tauFallInh'],
+            'tauAdapt': p['adaptTau'],
+            'noiseSigma': p['noiseSigma'],
+        }
+
         self._unitsExc = NeuronGroup(
             N=p['nExc'],
             model=unitModel,
@@ -99,6 +110,7 @@ class Network:
             reset=resetCode,
             refractory=p['refrExc'],
             clock=defaultclock,
+            namespace=neuron_namespace,
         )
         self._unitsInh = NeuronGroup(
             N=p['nInh'],
@@ -108,6 +120,7 @@ class Network:
             reset=resetCode,
             refractory=p['refrInh'],
             clock=defaultclock,
+            namespace=neuron_namespace,
         )
 
         mean_beta = p['betaAdaptExc']
@@ -176,13 +189,13 @@ class Network:
         us_indices_src = np.repeat(np.arange(nUS), len(us_times_s))
         us_times_expanded = np.tile(us_times_s, nUS)
 
-        CS_group = SpikeGeneratorGroup(nCS, cs_indices_src, cs_times_expanded * second)
-        US_group = SpikeGeneratorGroup(nUS, us_indices_src, us_times_expanded * second)
+        self._CS_group = SpikeGeneratorGroup(nCS, cs_indices_src, cs_times_expanded * second)
+        self._US_group = SpikeGeneratorGroup(nUS, us_indices_src, us_times_expanded * second)
 
-        syn_CS = Synapses(CS_group, self._unitsExc, on_pre='uExt_post += ' + str(p['spikeInputAmplitude']) + ' * nA')
-        syn_CS.connect(i=np.arange(nCS), j=cs_neuron_inds)
-        syn_US = Synapses(US_group, self._unitsExc, on_pre='uExt_post += ' + str(p['spikeInputAmplitude']) + ' * nA')
-        syn_US.connect(i=np.arange(nUS), j=us_neuron_inds)
+        self._syn_CS = Synapses(self._CS_group, self._unitsExc, on_pre='uExt_post += ' + str(p['spikeInputAmplitude']) + ' * nA')
+        self._syn_CS.connect(i=np.arange(nCS), j=cs_neuron_inds)
+        self._syn_US = Synapses(self._US_group, self._unitsExc, on_pre='uExt_post += ' + str(p['spikeInputAmplitude']) + ' * nA')
+        self._syn_US.connect(i=np.arange(nUS), j=us_neuron_inds)
 
     def _build_recurrent_synapses(self):
         p = self.params
@@ -192,6 +205,7 @@ class Network:
 
         tauRiseEOverMS = p['tauRiseExc'] / ms
         tauRiseIOverMS = p['tauRiseInh'] / ms
+        syn_namespace = {'tauRiseEOverMS': tauRiseEOverMS, 'tauRiseIOverMS': tauRiseIOverMS}
 
         if p.get('use_stdp', False):
             eqs_EE = '''
@@ -211,6 +225,7 @@ class Network:
             synapsesEE = Synapses(
                 source=unitsExc, target=unitsExc,
                 model=eqs_EE, on_pre=on_pre_EE, on_post=on_post_EE,
+                namespace=dict(syn_namespace),
             )
             preInds, postInds = adjacency_indices_within(p['nExc'], p['propConnect'], rng)
             synapsesEE.connect(i=preInds, j=postInds)
@@ -230,6 +245,7 @@ class Network:
                 model='jEE: amp',
                 source=unitsExc, target=unitsExc,
                 on_pre='uE_post += jEE / tauRiseEOverMS',
+                namespace=dict(syn_namespace),
             )
             preInds, postInds = adjacency_indices_within(p['nExc'], p['propConnect'], rng)
             synapsesEE.connect(i=preInds, j=postInds)
@@ -239,6 +255,7 @@ class Network:
             model='jEI: amp',
             source=unitsInh, target=unitsExc,
             on_pre='uI_post += jEI / tauRiseIOverMS',
+            namespace=dict(syn_namespace),
         )
         preInds, postInds = adjacency_indices_between(p['nInh'], p['nExc'], p['propConnect'], rng)
         synapsesEI.connect(i=preInds, j=postInds)
@@ -248,6 +265,7 @@ class Network:
             model='jIE: amp',
             source=unitsExc, target=unitsInh,
             on_pre='uE_post += jIE / tauRiseEOverMS',
+            namespace=dict(syn_namespace),
         )
         preInds, postInds = adjacency_indices_between(p['nExc'], p['nInh'], p['propConnect'], rng)
         synapsesIE.connect(i=preInds, j=postInds)
@@ -257,6 +275,7 @@ class Network:
             model='jII: amp',
             source=unitsInh, target=unitsInh,
             on_pre='uI_post += jII / tauRiseIOverMS',
+            namespace=dict(syn_namespace),
         )
         preInds, postInds = adjacency_indices_within(p['nInh'], p['propConnect'], rng)
         synapsesII.connect(i=preInds, j=postInds)
@@ -309,7 +328,25 @@ class Network:
 
         self._build_monitors()
 
-        run(p['duration'], report=p['reportType'], report_period=p['reportPeriod'], profile=p['doProfile'])
+        # Brian2's magic run() only collects objects in the current namespace; our objects
+        # live on self, so they are never included. Use an explicit Network and add all objects.
+        b2_net = B2Network(
+            self._unitsExc,
+            self._unitsInh,
+            self._CS_group,
+            self._US_group,
+            self._syn_CS,
+            self._syn_US,
+            self._synapsesEE,
+            self._synapsesEI,
+            self._synapsesIE,
+            self._synapsesII,
+            self._spikeMonExc,
+            self._spikeMonInh,
+            self._stateMonExc,
+            self._stateMonInh,
+        )
+        b2_net.run(p['duration'], report=p['reportType'], report_period=p['reportPeriod'], profile=p['doProfile'])
 
         p['weight_matrix_post'] = _build_weight_matrix(
             self._synapsesEE, self._synapsesEI, self._synapsesIE, self._synapsesII,
