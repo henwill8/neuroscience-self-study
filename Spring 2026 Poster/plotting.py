@@ -724,3 +724,44 @@ class SimpleResults:
         ax.set_title("EE weight change by block (mean ± SEM)")
         return created_fig
 
+
+def plot_all_figures(results, show=True):
+    """
+    Create the standard four poster figures from a SimpleResults instance.
+    Returns (fig1, fig2, fig3, fig4). If show is True, calls plt.show() at the end.
+    """
+    # Figure 1: raster, firing rate, voltage
+    fig1 = plt.figure(figsize=(8, 10))
+    ax_raster = fig1.add_subplot(3, 1, 1)
+    ax_rate = fig1.add_subplot(3, 1, 2)
+    ax_voltage = fig1.add_subplot(3, 1, 3)
+    results.plot_spike_raster(ax_raster)
+    results.plot_firing_rate(ax_rate)
+    results.plot_voltage_by_groups(ax_voltage)
+    fig1.tight_layout()
+
+    # Figure 2: PCA 3D, within/between correlation, PCA variance
+    fig2 = plt.figure(figsize=(10, 12))
+    gs = fig2.add_gridspec(3, 1, height_ratios=[2, 1, 1])
+    ax_pca = fig2.add_subplot(gs[0], projection='3d')
+    ax_corr = fig2.add_subplot(gs[1])
+    ax_var = fig2.add_subplot(gs[2])
+    results.plot_pca_3d_time_color(ax=ax_pca, use_upstate_only=True)
+    results.plot_within_between_correlations(ax=ax_corr)
+    results.plot_pca_variance(ax=ax_var, use_upstate_only=True)
+    fig2.tight_layout()
+
+    # Figure 3: weight change by block
+    fig3 = results.plot_weight_change_blocks()
+    if fig3 is not None:
+        fig3.tight_layout()
+
+    # Figure 4: PCA centroid trajectories
+    fig4 = results.plot_pca_centroid_trajectories(bin_size=10*ms, n_components=3)
+    if fig4 is not None:
+        fig4.tight_layout()
+
+    if show:
+        plt.show()
+    return fig1, fig2, fig3, fig4
+
