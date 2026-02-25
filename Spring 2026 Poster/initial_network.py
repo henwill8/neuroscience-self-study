@@ -9,6 +9,7 @@ from utils import (
     adjacency_indices_within,
     adjacency_indices_between,
     normal_weights,
+    save_network_checkpoint,
 )
 
 rng_seed = 42
@@ -27,13 +28,13 @@ params = {
     'doProfile': True,
 
     # CS-US training (red = CS, blue = US; paper: 440 ms red @ 25 Hz, 80 ms blue @ 50 Hz)
-    'nTrials': 1,
+    'nTrials': 50,
     'ISI': 360 * ms,              # time from CS onset to US onset (inter-stimulus interval)
     'propCS': 0.05,               # fraction of excitatory neurons selected for CS (red)
     'propUS': 0.05,               # fraction of excitatory neurons selected for US (blue)
     'interTrialInterval': 2 * second,
-    'include_CS_only_trial': False,  # if True, add one extra trial with CS only (no US)
-    'cs_only_every_n_trials': None,  # if int (e.g. 5), every nth trial is CS only (no US) to probe training
+    'include_CS_only_trial': True,  # if True, add one extra trial with CS only (no US)
+    'cs_only_every_n_trials': 10,  # if int (e.g. 5), every nth trial is CS only (no US) to probe training
     'CS_train_duration': 440 * ms,
     'CS_Hz': 25 * Hz,
     'US_train_duration': 80 * ms,
@@ -89,6 +90,10 @@ params = {
 
     # Voltage recording: how many neurons per population to record (None = all)
     'n_record_voltage': 100,
+
+    # Checkpoint: when True, save weights, params, and monitor data to a pickle file for later loading
+    'save_checkpoint': False,
+    'checkpoint_path': 'network_checkpoint.pkl',
 }
 
 # Derive duration from trial setup (no single duration param)
@@ -220,6 +225,11 @@ if every_n is not None and every_n >= 1:
 if params.get('include_CS_only_trial', False) and n_trials_total > n_trials_paired:
     cs_only_trial_inds.append(n_trials_paired)
 params['us_omit_times_s'] = np.array([trial_starts_s[i] + ISI_s for i in cs_only_trial_inds])
+# Trial structure for PCA centroid trajectories: start times, duration, condition per trial
+params['trial_starts_s'] = trial_starts_s
+params['trial_duration_s'] = float(params['trialDuration'] / second)
+cs_only_set = set(cs_only_trial_inds)
+params['trial_conditions'] = np.array(['CS' if i in cs_only_set else 'US' for i in range(n_trials_total)])
 
 # Expand to one spike per target neuron per pulse time
 cs_indices_src = np.repeat(np.arange(nCS), len(cs_times_s))
@@ -411,6 +421,17 @@ params['weight_matrix_post'] = build_weight_matrix(
     params['nExc'], params['nInh']
 )
 
+# Save checkpoint (weights, params, spike/voltage data) to pickle if requested
+if params.get('save_checkpoint', False):
+    save_network_checkpoint(
+        params['checkpoint_path'],
+        params,
+        spikeMonExc,
+        spikeMonInh,
+        stateMonExc,
+        stateMonInh,
+    )
+
 # =============================
 # Plots
 # =============================
@@ -449,5 +470,10 @@ fig2.tight_layout()
 fig3 = results.plot_weight_change_blocks()
 if fig3 is not None:
     fig3.tight_layout()
+
+# Figure 4: PCA centroid trajectories (CS vs US) and centroid distance over time
+fig4 = results.plot_pca_centroid_trajectories(bin_size=10*ms, n_components=3)
+if fig4 is not None:
+    fig4.tight_layout()
 
 plt.show()

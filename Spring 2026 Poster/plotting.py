@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.special import gammaln
+from sklearn.decomposition import PCA
 from brian2 import *
 import matplotlib.pyplot as plt
 from matplotlib import cm
@@ -165,6 +166,103 @@ def compute_pca_variance_explained(results, bin_size=5*ms, use_exc_only=True,
     return var_explained * 100
 
 
+def pca_condition_trajectories(data, conditions, n_components, condition_CS='CS', condition_US='US'):
+    """
+    Fit PCA on all trials combined, project each trial, compute condition centroids and their distance.
+
+    Parameters
+    ----------
+    data : ndarray, shape (n_trials, n_timepoints, n_neurons)
+        Trial-separated neural population data.
+    conditions : array-like, shape (n_trials,)
+        Condition label per trial (e.g. 'CS' or 'US', or 0/1). Must be comparable to condition_CS / condition_US.
+    n_components : int
+        Number of PCA components.
+    condition_CS : str or scalar
+        Label used for CS trials (default 'CS').
+    condition_US : str or scalar
+        Label used for US trials (default 'US').
+
+    Returns
+    -------
+    projected_trials : ndarray, shape (n_trials, n_timepoints, n_components)
+        Each trial projected into the shared PCA basis.
+    centroid_CS : ndarray, shape (n_timepoints, n_components)
+        Time-resolved centroid of CS trials in PCA space.
+    centroid_US : ndarray, shape (n_timepoints, n_components)
+        Time-resolved centroid of US trials in PCA space.
+    centroid_distance : ndarray, shape (n_timepoints,)
+        Euclidean distance between CS and US centroids at each timepoint.
+    """
+    data = np.asarray(data)
+    conditions = np.asarray(conditions)
+    n_trials, n_timepoints, n_neurons = data.shape
+
+    # Fit PCA once on combined data: (samples, neurons)
+    X_all = data.reshape(-1, n_neurons)
+    pca = PCA(n_components=n_components)
+    pca.fit(X_all)
+
+    # Project each trial into the shared basis
+    projected_trials = np.zeros((n_trials, n_timepoints, n_components))
+    for t in range(n_trials):
+        projected_trials[t] = pca.transform(data[t])  # (n_timepoints, n_components)
+
+    # Condition masks
+    is_CS = (conditions == condition_CS)
+    is_US = (conditions == condition_US)
+    n_CS = np.sum(is_CS)
+    n_US = np.sum(is_US)
+
+    # Time-resolved centroids (average across trials at each timepoint)
+    centroid_CS = np.mean(projected_trials[is_CS], axis=0) if n_CS > 0 else np.full((n_timepoints, n_components), np.nan)
+    centroid_US = np.mean(projected_trials[is_US], axis=0) if n_US > 0 else np.full((n_timepoints, n_components), np.nan)
+
+    # Euclidean distance between centroids over time
+    centroid_distance = np.linalg.norm(centroid_CS - centroid_US, axis=1)
+
+    return projected_trials, centroid_CS, centroid_US, centroid_distance
+
+
+def compute_trial_binned_data(results, bin_size=5*ms, use_exc_only=True):
+    """
+    Build trial-separated binned firing rate matrix from results.
+    Requires params: trial_starts_s, trial_duration_s, trial_conditions.
+
+    Returns
+    -------
+    data : ndarray, shape (n_trials, n_timepoints, n_neurons), or None if trial info missing
+    conditions : ndarray, shape (n_trials,), or None
+    """
+    p = results.p
+    if 'trial_starts_s' not in p or 'trial_duration_s' not in p or 'trial_conditions' not in p:
+        return None, None
+    trial_starts_s = np.asarray(p['trial_starts_s'])
+    trial_duration_s = float(p['trial_duration_s'])
+    conditions = np.asarray(p['trial_conditions'])
+    bin_size_s = float(bin_size / second)
+    n_trials = len(trial_starts_s)
+    n_timepoints = int(round(trial_duration_s / bin_size_s))
+    if n_timepoints < 1:
+        return None, None
+    n_neurons = p['nExc'] if use_exc_only else p['nUnits']
+    data = np.zeros((n_trials, n_timepoints, n_neurons))
+    for tr in range(n_trials):
+        t0 = trial_starts_s[tr]
+        t1 = t0 + trial_duration_s
+        bins = np.linspace(t0, t1, n_timepoints + 1)
+        for i in range(p['nExc']):
+            spikes = results.spikeMonExcT[results.spikeMonExcI == i]
+            counts, _ = np.histogram(spikes, bins)
+            data[tr, :, i] = counts[:n_timepoints] / bin_size_s
+        if not use_exc_only:
+            for i in range(p['nInh']):
+                spikes = results.spikeMonInhT[results.spikeMonInhI == i]
+                counts, _ = np.histogram(spikes, bins)
+                data[tr, :, p['nExc'] + i] = counts[:n_timepoints] / bin_size_s
+    return data, conditions
+
+
 def compute_block_weight_change(W_pre, W_post, groups, group_names=None):
     """
     Block-averaged weight change: for each (post, pre) group pair, compute mean and SEM
@@ -224,6 +322,24 @@ class SimpleResults:
         self.stateDT = float(stateMonExc.clock.dt / second)
         self.duration = float(params['duration'] / second)
         self.stateMonT = np.arange(0, self.duration, self.stateDT)
+
+    @classmethod
+    def from_checkpoint(cls, filepath):
+        """Build a SimpleResults instance from a saved checkpoint pickle (e.g. from save_network_checkpoint)."""
+        from utils import load_network_checkpoint
+        data = load_network_checkpoint(filepath)
+        r = cls.__new__(cls)
+        r.p = data['params']
+        r.spikeMonExcT = np.asarray(data['spike_t_exc'])
+        r.spikeMonExcI = np.asarray(data['spike_i_exc'])
+        r.spikeMonInhT = np.asarray(data['spike_t_inh'])
+        r.spikeMonInhI = np.asarray(data['spike_i_inh'])
+        r.stateMonExcV = np.asarray(data['state_v_exc'])
+        r.stateMonInhV = np.asarray(data['state_v_inh'])
+        r.stateDT = float(data['state_dt'])
+        r.duration = float(data['duration'])
+        r.stateMonT = np.arange(0, r.duration, r.stateDT)
+        return r
 
     def plot_spike_raster(self, ax):
         nExc = self.p['nExc']
@@ -501,6 +617,69 @@ class SimpleResults:
         title = "PCA variance explained (upstate only)" if use_upstate_only else "PCA variance explained (full)"
         ax.set_title(title)
         return ax
+
+    def plot_pca_centroid_trajectories(self, bin_size=5*ms, n_components=3,
+                                       ax_traj=None, ax_dist=None, use_exc_only=True):
+        """
+        Build trial-separated binned data, fit PCA on all trials, project and compute CS/US centroids,
+        then plot centroid trajectories (3D PC1–PC2–PC3) and centroid distance over time.
+        Requires params: trial_starts_s, trial_duration_s, trial_conditions.
+        Returns the figure if one was created, else None.
+        """
+        data, conditions = compute_trial_binned_data(self, bin_size, use_exc_only)
+        if data is None or data.size == 0:
+            return None
+        # Need both conditions to have at least one trial
+        uniq = np.unique(conditions)
+        if len(uniq) < 2:
+            return None
+        projected_trials, centroid_CS, centroid_US, centroid_distance = pca_condition_trajectories(
+            data, conditions, n_components, condition_CS='CS', condition_US='US'
+        )
+        bin_size_s = float(bin_size / second)
+        trial_duration_s = self.p['trial_duration_s']
+        n_timepoints = centroid_CS.shape[0]
+        time_s = (np.arange(n_timepoints) + 0.5) * bin_size_s
+
+        if ax_traj is None and ax_dist is None:
+            fig = plt.figure(figsize=(12, 5))
+            ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
+            ax_dist = fig.add_subplot(1, 2, 2)
+            created_fig = fig
+        else:
+            created_fig = None
+            if ax_traj is None:
+                ax_traj = plt.gca()
+            if ax_dist is None:
+                ax_dist = plt.gca()
+
+        # Left: 3D trajectory (PC1, PC2, PC3)
+        for ax_cur, cent, label, color in [
+            (ax_traj, centroid_CS, 'CS', 'C3'),
+            (ax_traj, centroid_US, 'US', 'C0'),
+        ]:
+            if np.any(np.isfinite(cent)):
+                ax_cur.plot(cent[:, 0], cent[:, 1], cent[:, 2], color=color, lw=2, alpha=0.9, label=label)
+                step = max(1, n_timepoints // 8)
+                for k in range(0, n_timepoints, step):
+                    ax_cur.scatter(cent[k, 0], cent[k, 1], cent[k, 2], c=[color], s=20, edgecolors='k', linewidths=0.5)
+        ax_traj.set_xlabel("PC1")
+        ax_traj.set_ylabel("PC2")
+        ax_traj.set_zlabel("PC3")
+        ax_traj.set_title("Condition centroid trajectories")
+        ax_traj.legend(loc='best')
+
+        # Right: centroid distance over time within trial
+        ax_dist.plot(time_s, centroid_distance, 'k-', lw=1.5)
+        ax_dist.fill_between(time_s, 0, centroid_distance, alpha=0.2)
+        ax_dist.set_xlabel("Time within trial (s)")
+        ax_dist.set_ylabel("CS–US centroid distance")
+        ax_dist.set_title("Centroid distance over time")
+        ax_dist.set_xlim(0, trial_duration_s)
+
+        if created_fig:
+            created_fig.tight_layout()
+        return created_fig
 
     def plot_weight_change_blocks(self, ax=None):
         """

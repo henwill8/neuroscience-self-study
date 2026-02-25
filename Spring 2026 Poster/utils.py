@@ -1,8 +1,9 @@
 """
 Utility functions for the poster network and analysis.
 """
+import pickle
 import numpy as np
-from brian2 import second
+from brian2 import second, mV
 from brian2.units import get_unit
 
 
@@ -55,3 +56,44 @@ def normal_weights(mean_current, n, weightCV, rng):
     weights = rng.normal(loc=mean_value, scale=std_value, size=n)
     weights = np.clip(weights, 0, None)
     return weights * unit
+
+
+def serialize_params(params):
+    """Convert params dict to pickle-safe form (Brian2 Quantity -> float/ndarray)."""
+    out = {}
+    for k, v in params.items():
+        if hasattr(v, 'dimensions'):
+            u = get_unit(v.dimensions)
+            arr = np.asarray(v / u)
+            out[k] = float(arr.flat[0]) if arr.size == 1 else arr.copy()
+        elif isinstance(v, np.ndarray):
+            out[k] = v.copy()
+        else:
+            out[k] = v
+    return out
+
+
+def save_network_checkpoint(filepath, params, spikeMonExc, spikeMonInh, stateMonExc, stateMonInh):
+    """
+    Save weights, params, and monitor data to a pickle file for later loading.
+    params should already contain weight_matrix_pre and weight_matrix_post (numpy arrays).
+    """
+    data = {
+        'params': serialize_params(params),
+        'spike_t_exc': np.asarray(spikeMonExc.t / second),
+        'spike_i_exc': np.asarray(spikeMonExc.i),
+        'spike_t_inh': np.asarray(spikeMonInh.t / second),
+        'spike_i_inh': np.asarray(spikeMonInh.i),
+        'state_v_exc': np.asarray(stateMonExc.v / mV),
+        'state_v_inh': np.asarray(stateMonInh.v / mV),
+        'state_dt': float(stateMonExc.clock.dt / second),
+        'duration': float(params['duration'] / second),
+    }
+    with open(filepath, 'wb') as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_network_checkpoint(filepath):
+    """Load a saved checkpoint dict from a pickle file."""
+    with open(filepath, 'rb') as f:
+        return pickle.load(f)
