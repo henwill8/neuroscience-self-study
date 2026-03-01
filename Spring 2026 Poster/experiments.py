@@ -45,7 +45,7 @@ def _run_network(params, rng, show_plots=True):
 # Experiments
 # ---------------------------------------------------------------------------
 
-@_register("default", "Default network: full default params, 50 trials, all figures.")
+@_register("default", "Default network: full default params.")
 def run_default(show_plots=True):
     """Run the standard network with no param overrides."""
     seed(42)
@@ -71,6 +71,42 @@ def run_template(show_plots=True):
     params['nUnits'] = 500
     params['n_record_voltage'] = 20
     derive_trial_params(params)  # required when changing nTrials, interTrialInterval, etc.
+    return _run_network(params, rng, show_plots=show_plots)
+
+
+@_register("continue", "Load weights from a checkpoint; all other params from defaults (or overrides).")
+def run_continue(show_plots=True, checkpoint_path="results/network_checkpoint.pkl", **param_overrides):
+    """
+    Load only weights from checkpoint_path. Params come from get_default_params(); pass any overrides as kwargs.
+    Network size (nExc, nInh) must match the checkpoint.
+
+    Example (from code):
+      run_continue(show_plots=False, checkpoint_path="results/ckpt.pkl", nTrials=20)
+    """
+    seed(42)
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    params = get_default_params()
+    params['load_checkpoint_path'] = checkpoint_path
+    for key, value in param_overrides.items():
+        params[key] = value
+    derive_trial_params(params)
+    return _run_network(params, rng, show_plots=show_plots)
+
+
+@_register("continue_custom", "Example: load weights from checkpoint and set params in the function body (copy to add your own).")
+def run_continue_custom(show_plots=True):
+    """
+    Load weights from a checkpoint; set params in this function. Copy and edit for your own experiment.
+    """
+    seed(42)
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    params = get_default_params()
+    params['load_checkpoint_path'] = "results/network_checkpoint.pkl"
+    params['nTrials'] = 10
+    params['checkpoint_path'] = 'results/continued_experiment.pkl'
+    derive_trial_params(params)
     return _run_network(params, rng, show_plots=show_plots)
 
 

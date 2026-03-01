@@ -3,7 +3,7 @@ Utility functions for the poster network and analysis.
 """
 import pickle
 import numpy as np
-from brian2 import second, mV
+from brian2 import second
 from brian2.units import get_unit
 
 
@@ -58,42 +58,31 @@ def normal_weights(mean_current, n, weightCV, rng):
     return weights * unit
 
 
-def serialize_params(params):
-    """Convert params dict to pickle-safe form (Brian2 Quantity -> float/ndarray)."""
-    out = {}
-    for k, v in params.items():
-        if hasattr(v, 'dimensions'):
-            u = get_unit(v.dimensions)
-            arr = np.asarray(v / u)
-            out[k] = float(arr.flat[0]) if arr.size == 1 else arr.copy()
-        elif isinstance(v, np.ndarray):
-            out[k] = v.copy()
-        else:
-            out[k] = v
-    return out
-
-
-def save_network_checkpoint(filepath, params, spikeMonExc, spikeMonInh, stateMonExc, stateMonInh):
+def save_network_checkpoint(filepath, params):
     """
-    Save weights, params, and monitor data to a pickle file for later loading.
-    params should already contain weight_matrix_pre and weight_matrix_post (numpy arrays).
+    Save a weights-only checkpoint: weight_matrix_post and dimensions (nExc, nInh).
+    Params should already contain weight_matrix_post, nExc, nInh (e.g. after a run).
     """
     data = {
-        'params': serialize_params(params),
-        'spike_t_exc': np.asarray(spikeMonExc.t / second),
-        'spike_i_exc': np.asarray(spikeMonExc.i),
-        'spike_t_inh': np.asarray(spikeMonInh.t / second),
-        'spike_i_inh': np.asarray(spikeMonInh.i),
-        'state_v_exc': np.asarray(stateMonExc.v / mV),
-        'state_v_inh': np.asarray(stateMonInh.v / mV),
-        'state_dt': float(stateMonExc.clock.dt / second),
-        'duration': float(params['duration'] / second),
+        'checkpoint_type': 'weights',
+        'weight_matrix_post': np.asarray(params['weight_matrix_post'], dtype=float).copy(),
+        'nExc': int(params['nExc']),
+        'nInh': int(params['nInh']),
     }
     with open(filepath, 'wb') as f:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def load_network_checkpoint(filepath):
-    """Load a saved checkpoint dict from a pickle file."""
+def load_weights_checkpoint(filepath):
+    """
+    Load a weights-only checkpoint; return (weight_matrix_post, nExc, nInh).
+    """
     with open(filepath, 'rb') as f:
-        return pickle.load(f)
+        data = pickle.load(f)
+    if data.get('checkpoint_type') != 'weights':
+        raise ValueError("Checkpoint must be weights-only; got checkpoint_type=%r" % data.get('checkpoint_type'))
+    return (
+        np.asarray(data['weight_matrix_post'], dtype=float),
+        int(data['nExc']),
+        int(data['nInh']),
+    )

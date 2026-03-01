@@ -331,25 +331,6 @@ class SimpleResults:
         n_times = self.stateMonExcV.shape[1]
         self.stateMonT = np.arange(n_times, dtype=float) * self.stateDT
 
-    @classmethod
-    def from_checkpoint(cls, filepath):
-        """Build a SimpleResults instance from a saved checkpoint pickle (e.g. from save_network_checkpoint)."""
-        from utils import load_network_checkpoint
-        data = load_network_checkpoint(filepath)
-        r = cls.__new__(cls)
-        r.p = data['params']
-        r.spikeMonExcT = np.asarray(data['spike_t_exc'])
-        r.spikeMonExcI = np.asarray(data['spike_i_exc'])
-        r.spikeMonInhT = np.asarray(data['spike_t_inh'])
-        r.spikeMonInhI = np.asarray(data['spike_i_inh'])
-        r.stateMonExcV = np.asarray(data['state_v_exc'])
-        r.stateMonInhV = np.asarray(data['state_v_inh'])
-        r.stateDT = float(data['state_dt'])
-        r.duration = float(data['duration'])
-        n_times = r.stateMonExcV.shape[1]
-        r.stateMonT = np.arange(n_times, dtype=float) * r.stateDT
-        return r
-
     def plot_spike_raster(self, ax):
         nExc = self.p['nExc']
         nInh = self.p['nInh']

@@ -14,6 +14,7 @@ from utils import (
     adjacency_indices_between,
     normal_weights,
     save_network_checkpoint,
+    load_weights_checkpoint,
 )
 
 
@@ -291,6 +292,113 @@ class Network:
         self._synapsesIE = synapsesIE
         self._synapsesII = synapsesII
 
+    def _build_recurrent_synapses_from_checkpoint(self):
+        """Build recurrent synapses from params['weight_matrix_post'] (e.g. from a loaded checkpoint)."""
+        p = self.params
+        rng = self.rng
+        unitsExc = self._unitsExc
+        unitsInh = self._unitsInh
+        nExc, nInh = p['nExc'], p['nInh']
+        W = np.asarray(p['weight_matrix_post'], dtype=float)
+
+        tauRiseEOverMS = p['tauRiseExc'] / ms
+        tauRiseIOverMS = p['tauRiseInh'] / ms
+        syn_namespace = {'tauRiseEOverMS': tauRiseEOverMS, 'tauRiseIOverMS': tauRiseIOverMS}
+
+        def connect_from_block(W_block):
+            """(post_inds, pre_inds, weights) from nonzero entries of W_block (post, pre)."""
+            post_inds, pre_inds = np.where(W_block != 0)
+            weights = W_block[post_inds, pre_inds]
+            return pre_inds, post_inds, weights
+
+        # EE: W[0:nExc, 0:nExc]
+        pre_ee, post_ee, w_ee = connect_from_block(W[0:nExc, 0:nExc])
+        if p.get('use_stdp', False):
+            eqs_EE = '''
+                jEE : amp
+                dapre/dt = -apre / tau_stdp_pre : 1 (event-driven)
+                dapost/dt = -apost / tau_stdp_post : 1 (event-driven)
+            '''
+            on_pre_EE = '''
+                uE_post += jEE / tauRiseEOverMS
+                apre += 1
+                jEE = clip(jEE + A_plus_stdp * apost, w_min_EE, w_max_EE)
+            '''
+            on_post_EE = '''
+                apost += 1
+                jEE = clip(jEE - A_minus_stdp * apre, w_min_EE, w_max_EE)
+            '''
+            synapsesEE = Synapses(
+                source=unitsExc, target=unitsExc,
+                model=eqs_EE, on_pre=on_pre_EE, on_post=on_post_EE,
+                namespace=dict(syn_namespace),
+            )
+            synapsesEE.connect(i=pre_ee, j=post_ee)
+            synapsesEE.jEE = w_ee * amp  # checkpoint stores weights in SI (amperes)
+            synapsesEE.apre = 0
+            synapsesEE.apost = 0
+            synapsesEE.namespace.update({
+                'tau_stdp_pre': p['tau_stdp_pre'],
+                'tau_stdp_post': p['tau_stdp_post'],
+                'A_plus_stdp': p['A_plus_stdp'],
+                'A_minus_stdp': p['A_minus_stdp'],
+                'w_min_EE': p['w_min_EE'],
+                'w_max_EE': p['w_max_EE'],
+            })
+        else:
+            synapsesEE = Synapses(
+                model='jEE: amp',
+                source=unitsExc, target=unitsExc,
+                on_pre='uE_post += jEE / tauRiseEOverMS',
+                namespace=dict(syn_namespace),
+            )
+            synapsesEE.connect(i=pre_ee, j=post_ee)
+            synapsesEE.jEE = w_ee * amp  # checkpoint stores weights in SI (amperes)
+
+        # EI: W[0:nExc, nExc:nExc+nInh]
+        pre_ei, post_ei, w_ei = connect_from_block(W[0:nExc, nExc : nExc + nInh])
+        synapsesEI = Synapses(
+            model='jEI: amp',
+            source=unitsInh, target=unitsExc,
+            on_pre='uI_post += jEI / tauRiseIOverMS',
+            namespace=dict(syn_namespace),
+        )
+        synapsesEI.connect(i=pre_ei, j=post_ei)
+        synapsesEI.jEI = w_ei * amp  # checkpoint stores weights in SI (amperes)
+
+        # IE: W[nExc:nExc+nInh, 0:nExc]
+        pre_ie, post_ie, w_ie = connect_from_block(W[nExc : nExc + nInh, 0:nExc])
+        synapsesIE = Synapses(
+            model='jIE: amp',
+            source=unitsExc, target=unitsInh,
+            on_pre='uE_post += jIE / tauRiseEOverMS',
+            namespace=dict(syn_namespace),
+        )
+        synapsesIE.connect(i=pre_ie, j=post_ie)
+        synapsesIE.jIE = w_ie * amp  # checkpoint stores weights in SI (amperes)
+
+        # II: W[nExc:nExc+nInh, nExc:nExc+nInh]
+        pre_ii, post_ii, w_ii = connect_from_block(W[nExc : nExc + nInh, nExc : nExc + nInh])
+        synapsesII = Synapses(
+            model='jII: amp',
+            source=unitsInh, target=unitsInh,
+            on_pre='uI_post += jII / tauRiseIOverMS',
+            namespace=dict(syn_namespace),
+        )
+        synapsesII.connect(i=pre_ii, j=post_ii)
+        synapsesII.jII = w_ii * amp  # checkpoint stores weights in SI (amperes)
+
+        # Delays not stored in checkpoint; resample
+        synapsesEE.delay = ((rng.random(synapsesEE.delay.shape[0]) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        synapsesEI.delay = ((rng.random(synapsesEI.delay.shape[0]) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        synapsesIE.delay = ((rng.random(synapsesIE.delay.shape[0]) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        synapsesII.delay = ((rng.random(synapsesII.delay.shape[0]) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+
+        self._synapsesEE = synapsesEE
+        self._synapsesEI = synapsesEI
+        self._synapsesIE = synapsesIE
+        self._synapsesII = synapsesII
+
     def _build_monitors(self):
         p = self.params
         self._spikeMonExc = SpikeMonitor(self._unitsExc)
@@ -314,17 +422,32 @@ class Network:
         """
         Build network (neurons, CS/US input, recurrent synapses, monitors), run simulation,
         store pre/post weight matrices, optionally save checkpoint.
+        If params['load_checkpoint_path'] is set, weights are loaded from that file and
+        must match current nExc, nInh; all other params come from the current params dict.
         Returns (params, spikeMonExc, spikeMonInh, stateMonExc, stateMonInh).
         """
         self._build_neurons()
         self._build_cs_us_input()
-        self._build_recurrent_synapses()
 
         p = self.params
-        p['weight_matrix_pre'] = _build_weight_matrix(
-            self._synapsesEE, self._synapsesEI, self._synapsesIE, self._synapsesII,
-            p['nExc'], p['nInh'],
-        )
+        load_path = p.get('load_checkpoint_path')
+        if load_path:
+            w_post, ckpt_nExc, ckpt_nInh = load_weights_checkpoint(load_path)
+            if ckpt_nExc != p['nExc'] or ckpt_nInh != p['nInh']:
+                raise ValueError(
+                    "Checkpoint network size (nExc=%d, nInh=%d) does not match current params (nExc=%d, nInh=%d)."
+                    % (ckpt_nExc, ckpt_nInh, p['nExc'], p['nInh'])
+                )
+            p['weight_matrix_post'] = w_post
+            p['weight_matrix_pre'] = np.asarray(w_post, dtype=float).copy()
+            p['load_checkpoint_path'] = None  # so saved checkpoint doesn't re-load this path
+            self._build_recurrent_synapses_from_checkpoint()
+        else:
+            self._build_recurrent_synapses()
+            p['weight_matrix_pre'] = _build_weight_matrix(
+                self._synapsesEE, self._synapsesEI, self._synapsesIE, self._synapsesII,
+                p['nExc'], p['nInh'],
+            )
 
         self._build_monitors()
 
@@ -354,14 +477,7 @@ class Network:
         )
 
         if p.get('save_checkpoint', False):
-            save_network_checkpoint(
-                p['checkpoint_path'],
-                p,
-                self._spikeMonExc,
-                self._spikeMonInh,
-                self._stateMonExc,
-                self._stateMonInh,
-            )
+            save_network_checkpoint(p['checkpoint_path'], p)
 
         return (
             p,
@@ -373,13 +489,17 @@ class Network:
 
 
 def main():
-    """Default entry point: run network with default params and show all figures."""
+    """Default entry point: run network with default params and show all figures.
+    To load weights from a checkpoint, set params['load_checkpoint_path'] or pass the path as first sys.argv."""
+    import sys
     rng_seed = 42
     seed(rng_seed)
     np.random.seed(rng_seed)
     rng = np.random.default_rng(rng_seed)
 
     params = get_default_params()
+    if len(sys.argv) > 1:
+        params['load_checkpoint_path'] = sys.argv[1]
     net = Network(params, rng)
     params, spikeMonExc, spikeMonInh, stateMonExc, stateMonInh = net.run()
 

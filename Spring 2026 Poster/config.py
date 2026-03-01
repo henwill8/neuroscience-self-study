@@ -1,6 +1,7 @@
 """
 Default network parameters. Call get_default_params() to get a copy with derived fields set.
 """
+import numpy as np
 from brian2 import *
 from utils import trial_duration
 
@@ -29,13 +30,13 @@ def get_default_params():
         # CS-US training (red = CS, blue = US; paper: 440 ms red @ 25 Hz, 80 ms blue @ 50 Hz)
         # -------------------------------------------------------------------------
         'nTrials': 50,
-        'ISI': 360 * ms,              # time from CS onset to US onset (inter-stimulus interval)
+        'ISI': 750 * ms,              # time from CS onset to US onset (inter-stimulus interval)
         'propCS': 0.05,               # fraction of excitatory neurons selected for CS (red)
         'propUS': 0.05,               # fraction of excitatory neurons selected for US (blue)
         'interTrialInterval': 2 * second,
         'include_CS_only_trial': True,   # if True, add one extra trial with CS only (no US)
         'cs_only_every_n_trials': 10,    # if int (e.g. 5), every nth trial is CS only (no US) to probe training
-        'CS_train_duration': 440 * ms,
+        'CS_train_duration': 800 * ms,
         'CS_Hz': 25 * Hz,
         'US_train_duration': 80 * ms,
         'US_Hz': 50 * Hz,
@@ -108,9 +109,11 @@ def get_default_params():
         # -------------------------------------------------------------------------
         # Recording and checkpoint
         # -------------------------------------------------------------------------
+        # I dont think this one is working
         'n_record_voltage': 100,   # how many neurons per population to record (None = all)
-        'save_checkpoint': True,  # when True, save weights, params, and monitor data to pickle for later loading
-        'checkpoint_path': 'results/network_checkpoint.pkl',
+        'save_checkpoint': True,  # when True, save weights to checkpoint_path
+        'checkpoint_path': 'results/new_interval_training.pkl',
+        'load_checkpoint_path': None,  # if set, load weights from this file (params from get_default_params / overrides)
     }
     derive_trial_params(params)
     return params
