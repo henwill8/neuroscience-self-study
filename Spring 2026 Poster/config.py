@@ -20,7 +20,7 @@ def derive_trial_params(params):
 def get_default_params():
     """Return the default params dict with trial duration and simulation length derived."""
     params = {
-        'dt': 0.1 * ms,
+        'dt': 0.05 * ms,
 
         'reportType': 'stdout',
         'reportPeriod': 10 * second,
@@ -29,14 +29,14 @@ def get_default_params():
         # -------------------------------------------------------------------------
         # CS-US training (red = CS, blue = US; paper: 440 ms red @ 25 Hz, 80 ms blue @ 50 Hz)
         # -------------------------------------------------------------------------
-        'nTrials': 50,
-        'ISI': 750 * ms,              # time from CS onset to US onset (inter-stimulus interval)
+        'nTrials': 3,
+        'ISI': 360 * ms,              # time from CS onset to US onset (inter-stimulus interval)
         'propCS': 0.05,               # fraction of excitatory neurons selected for CS (red)
         'propUS': 0.05,               # fraction of excitatory neurons selected for US (blue)
         'interTrialInterval': 2 * second,
         'include_CS_only_trial': True,   # if True, add one extra trial with CS only (no US)
-        'cs_only_every_n_trials': 10,    # if int (e.g. 5), every nth trial is CS only (no US) to probe training
-        'CS_train_duration': 800 * ms,
+        'cs_only_every_n_trials': None,    # if int (e.g. 5), every nth trial is CS only (no US) to probe training
+        'CS_train_duration': 440 * ms,
         'CS_Hz': 25 * Hz,
         'US_train_duration': 80 * ms,
         'US_Hz': 50 * Hz,
@@ -86,9 +86,23 @@ def get_default_params():
         'weightCV': 0.1,   # 10% std relative to mean
 
         # -------------------------------------------------------------------------
-        # STDP (only EE when use_stdp is True)
+        # STDP (only EE when use_stdp is True). Per-block toggles: CS, US, NS (non-stimulated).
+        # stdp_blocks: None = all True; else dict e.g. {'CS_NS': True, 'US_CS': False}.
+        # Keys: CS_CS, CS_US, CS_NS, US_CS, US_US, US_NS, NS_CS, NS_US, NS_NS.
+        # Default: STDP only on connections where CS is presynaptic (CS_CS, CS_US, CS_NS).
         # -------------------------------------------------------------------------
-        'use_stdp': True,
+        'use_stdp': False,
+        'stdp_blocks': {
+            'CS_CS': False,
+            'CS_US': False,
+            'CS_NS': False,
+            'US_CS': False,
+            'US_US': False,
+            'US_NS': False,
+            'NS_CS': False,
+            'NS_US': True,
+            'NS_NS': False,
+        },
         'tau_stdp_pre': 20 * ms,
         'tau_stdp_post': 20 * ms,
         'A_plus_stdp': 5 * pA,   # LTP when pre before post
@@ -107,13 +121,21 @@ def get_default_params():
         'delayInh': 0.5 * ms,
 
         # -------------------------------------------------------------------------
+        # Analysis options
+        # -------------------------------------------------------------------------
+        'measure_ns_peak_firing': True,   # if True, compute peak avg firing time and variance for NS (non-stimulated) exc group
+
+        # -------------------------------------------------------------------------
         # Recording and checkpoint
         # -------------------------------------------------------------------------
+
         # I dont think this one is working
         'n_record_voltage': 100,   # how many neurons per population to record (None = all)
-        'save_checkpoint': True,  # when True, save weights to checkpoint_path
-        'checkpoint_path': 'results/new_interval_training.pkl',
+
+        'save_checkpoint': False,  # when True, save weights to checkpoint_path
+        'checkpoint_path': 'results/360_long_stdp_network_checkpoint.pkl',
         'load_checkpoint_path': None,  # if set, load weights from this file (params from get_default_params / overrides)
+        # 'load_checkpoint_path': 'results/360_long_stdp_network_checkpoint.pkl',
     }
     derive_trial_params(params)
     return params

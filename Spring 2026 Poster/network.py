@@ -17,6 +17,36 @@ from utils import (
     load_weights_checkpoint,
 )
 
+# EE group block keys for stdp_blocks config (pre_post): CS, US, NS
+STDP_BLOCK_KEYS = ['CS_CS', 'CS_US', 'CS_NS', 'US_CS', 'US_US', 'US_NS', 'NS_CS', 'NS_US', 'NS_NS']
+
+
+def _ee_stdp_use_flags(pre_inds, post_inds, cs_inds, us_inds, stdp_blocks):
+    """
+    Return 1d array of 0/1: 1 if STDP is enabled for that EE synapse, else 0.
+    stdp_blocks: None = all True; else dict mapping e.g. 'CS_NS' -> True/False.
+    """
+    cs_set = set(np.atleast_1d(cs_inds))
+    us_set = set(np.atleast_1d(us_inds))
+    n = len(pre_inds)
+    use = np.ones(n, dtype=np.int32)
+    if stdp_blocks is None:
+        return use
+
+    def group(neuron_idx):
+        if neuron_idx in cs_set:
+            return 0
+        if neuron_idx in us_set:
+            return 1
+        return 2
+
+    for k in range(n):
+        pre_g = group(pre_inds[k])
+        post_g = group(post_inds[k])
+        key = STDP_BLOCK_KEYS[pre_g * 3 + post_g]
+        use[k] = 1 if stdp_blocks.get(key, True) else 0
+    return use
+
 
 def _build_weight_matrix(syn_EE, syn_EI, syn_IE, syn_II, nExc, nInh):
     """
@@ -198,6 +228,30 @@ class Network:
         self._syn_US = Synapses(self._US_group, self._unitsExc, on_pre='uExt_post += ' + str(p['spikeInputAmplitude']) + ' * nA')
         self._syn_US.connect(i=np.arange(nUS), j=us_neuron_inds)
 
+        # Optional: perturb NS neurons at a given trial and time (for testing)
+        self._NS_perturb_group = None
+        self._syn_NS_perturb = None
+        pert_trial = p.get('ns_perturbation_trial')
+        pert_t_s = p.get('ns_perturbation_t_s')
+        pert_amp = p.get('ns_perturbation_amplitude')
+        if pert_trial is not None and pert_t_s is not None and 0 <= pert_trial < n_trials_total:
+            ns_inds = np.array([i for i in range(p['nExc']) if i not in cs_neuron_inds and i not in us_neuron_inds])
+            if len(ns_inds) > 0:
+                t_pert = trial_starts_s[pert_trial] + float(pert_t_s)
+                amp = float(pert_amp if pert_amp is not None else p['spikeInputAmplitude'])
+                n_ns = len(ns_inds)
+                self._NS_perturb_group = SpikeGeneratorGroup(
+                    n_ns,
+                    np.arange(n_ns),
+                    np.full(n_ns, t_pert) * second,
+                )
+                self._syn_NS_perturb = Synapses(
+                    self._NS_perturb_group,
+                    self._unitsExc,
+                    on_pre='uExt_post += ' + str(amp) + ' * nA',
+                )
+                self._syn_NS_perturb.connect(i=np.arange(n_ns), j=ns_inds)
+
     def _build_recurrent_synapses(self):
         p = self.params
         rng = self.rng
@@ -211,17 +265,18 @@ class Network:
         if p.get('use_stdp', False):
             eqs_EE = '''
                 jEE : amp
+                use_stdp : 1 (constant)
                 dapre/dt = -apre / tau_stdp_pre : 1 (event-driven)
                 dapost/dt = -apost / tau_stdp_post : 1 (event-driven)
             '''
             on_pre_EE = '''
                 uE_post += jEE / tauRiseEOverMS
                 apre += 1
-                jEE = clip(jEE + A_plus_stdp * apost, w_min_EE, w_max_EE)
+                jEE = clip(jEE + use_stdp * A_plus_stdp * apost, w_min_EE, w_max_EE)
             '''
             on_post_EE = '''
                 apost += 1
-                jEE = clip(jEE - A_minus_stdp * apre, w_min_EE, w_max_EE)
+                jEE = clip(jEE - use_stdp * A_minus_stdp * apre, w_min_EE, w_max_EE)
             '''
             synapsesEE = Synapses(
                 source=unitsExc, target=unitsExc,
@@ -231,6 +286,11 @@ class Network:
             preInds, postInds = adjacency_indices_within(p['nExc'], p['propConnect'], rng)
             synapsesEE.connect(i=preInds, j=postInds)
             synapsesEE.jEE = normal_weights(p['jEE'], len(synapsesEE), p['weightCV'], rng)
+            synapsesEE.use_stdp = _ee_stdp_use_flags(
+                preInds, postInds,
+                p['cs_neuron_inds'], p['us_neuron_inds'],
+                p.get('stdp_blocks'),
+            )
             synapsesEE.apre = 0
             synapsesEE.apost = 0
             synapsesEE.namespace.update({
@@ -316,17 +376,18 @@ class Network:
         if p.get('use_stdp', False):
             eqs_EE = '''
                 jEE : amp
+                use_stdp : 1 (constant)
                 dapre/dt = -apre / tau_stdp_pre : 1 (event-driven)
                 dapost/dt = -apost / tau_stdp_post : 1 (event-driven)
             '''
             on_pre_EE = '''
                 uE_post += jEE / tauRiseEOverMS
                 apre += 1
-                jEE = clip(jEE + A_plus_stdp * apost, w_min_EE, w_max_EE)
+                jEE = clip(jEE + use_stdp * A_plus_stdp * apost, w_min_EE, w_max_EE)
             '''
             on_post_EE = '''
                 apost += 1
-                jEE = clip(jEE - A_minus_stdp * apre, w_min_EE, w_max_EE)
+                jEE = clip(jEE - use_stdp * A_minus_stdp * apre, w_min_EE, w_max_EE)
             '''
             synapsesEE = Synapses(
                 source=unitsExc, target=unitsExc,
@@ -335,6 +396,11 @@ class Network:
             )
             synapsesEE.connect(i=pre_ee, j=post_ee)
             synapsesEE.jEE = w_ee * amp  # checkpoint stores weights in SI (amperes)
+            synapsesEE.use_stdp = _ee_stdp_use_flags(
+                pre_ee, post_ee,
+                p['cs_neuron_inds'], p['us_neuron_inds'],
+                p.get('stdp_blocks'),
+            )
             synapsesEE.apre = 0
             synapsesEE.apost = 0
             synapsesEE.namespace.update({
@@ -453,7 +519,7 @@ class Network:
 
         # Brian2's magic run() only collects objects in the current namespace; our objects
         # live on self, so they are never included. Use an explicit Network and add all objects.
-        b2_net = B2Network(
+        b2_objects = [
             self._unitsExc,
             self._unitsInh,
             self._CS_group,
@@ -468,7 +534,10 @@ class Network:
             self._spikeMonInh,
             self._stateMonExc,
             self._stateMonInh,
-        )
+        ]
+        if self._NS_perturb_group is not None and self._syn_NS_perturb is not None:
+            b2_objects.extend([self._NS_perturb_group, self._syn_NS_perturb])
+        b2_net = B2Network(*b2_objects)
         b2_net.run(p['duration'], report=p['reportType'], report_period=p['reportPeriod'], profile=p['doProfile'])
 
         p['weight_matrix_post'] = _build_weight_matrix(

@@ -110,19 +110,26 @@ def detect_upstates(results, bin_size=10*ms, use_exc_only=True,
 
 def compute_within_between_correlations(results, bin_size=5*ms):
     """
-    Mean correlation within (CS, US, other) and between (CS-US, CS-other, US-other).
+    Mean correlation within (CS, US, NS) and between (CS-US, CS-NS, US-NS).
     Returns dict or None if CS/US not in params.
+    Uses safe correlation (avoids divide-by-zero when a neuron has zero variance).
     """
     if 'cs_neuron_inds' not in results.p or 'us_neuron_inds' not in results.p:
         return None
     X = compute_population_matrix(results, bin_size, use_exc_only=True, subtract_mean=False)
     if X.shape[0] < 2 or X.shape[1] < 2:
-        return {k: np.nan for k in ('within_CS', 'within_US', 'within_other', 'between_CS_US', 'between_CS_other', 'between_US_other')}
-    R = np.corrcoef(X.T)
+        return {k: np.nan for k in ('within_CS', 'within_US', 'within_NS', 'between_CS_US', 'between_CS_NS', 'between_US_NS')}
+    # Safe correlation: avoid divide-by-zero for constant (zero-variance) neurons
+    C = np.cov(X.T)
+    std = np.sqrt(np.maximum(np.diag(C), 0.0))
+    std_safe = np.where(std > 1e-12, std, np.nan)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        R = C / np.outer(std_safe, std_safe)
+    np.fill_diagonal(R, 1.0)
     nExc = results.p['nExc']
     cs_set = set(results.p['cs_neuron_inds'])
     us_set = set(results.p['us_neuron_inds'])
-    other_inds = np.array([i for i in range(nExc) if i not in cs_set and i not in us_set])
+    ns_inds = np.array([i for i in range(nExc) if i not in cs_set and i not in us_set])
     cs_inds = np.array(results.p['cs_neuron_inds'])
     us_inds = np.array(results.p['us_neuron_inds'])
 
@@ -136,10 +143,10 @@ def compute_within_between_correlations(results, bin_size=5*ms):
     out = {}
     out['within_CS'] = mean_upper_triangle(R[np.ix_(cs_inds, cs_inds)]) if len(cs_inds) >= 2 else np.nan
     out['within_US'] = mean_upper_triangle(R[np.ix_(us_inds, us_inds)]) if len(us_inds) >= 2 else np.nan
-    out['within_other'] = mean_upper_triangle(R[np.ix_(other_inds, other_inds)]) if len(other_inds) >= 2 else np.nan
+    out['within_NS'] = mean_upper_triangle(R[np.ix_(ns_inds, ns_inds)]) if len(ns_inds) >= 2 else np.nan
     out['between_CS_US'] = np.nanmean(R[np.ix_(cs_inds, us_inds)]) if len(cs_inds) and len(us_inds) else np.nan
-    out['between_CS_other'] = np.nanmean(R[np.ix_(cs_inds, other_inds)]) if len(cs_inds) and len(other_inds) else np.nan
-    out['between_US_other'] = np.nanmean(R[np.ix_(us_inds, other_inds)]) if len(us_inds) and len(other_inds) else np.nan
+    out['between_CS_NS'] = np.nanmean(R[np.ix_(cs_inds, ns_inds)]) if len(cs_inds) and len(ns_inds) else np.nan
+    out['between_US_NS'] = np.nanmean(R[np.ix_(us_inds, ns_inds)]) if len(us_inds) and len(ns_inds) else np.nan
     return out
 
 
@@ -269,14 +276,144 @@ def compute_trial_binned_data(results, bin_size=5*ms, use_exc_only=True):
     return data, conditions
 
 
+def compute_ns_peak_firing_stats(results, bin_size=5*ms):
+    """
+    For the non-stimulated (NS) excitatory neuron group (neurons that are neither CS nor US),
+    compute the peak average firing time within each trial and its statistics across trials.
+
+    For each trial: average firing rate across NS neurons in each time bin; the time (within trial)
+    at which this average is maximum is the "peak time" for that trial.
+    Returns mean and variance of these peak times across trials.
+
+    Requires params: trial_starts_s, trial_duration_s, cs_neuron_inds, us_neuron_inds.
+
+    Returns
+    -------
+    dict with keys:
+        mean_peak_time_s : float
+            Mean time (s within trial) of peak NS firing across trials.
+        variance_peak_time_s : float
+            Variance of peak time across trials (s^2).
+        peak_times_per_trial_s : ndarray, shape (n_trials,)
+            Peak time (s within trial) for each trial; np.nan if no valid peak.
+        n_ns_neurons : int
+            Number of NS (non-stimulated) excitatory neurons.
+    or None if trial info or CS/US indices are missing.
+    """
+    p = results.p
+    if 'trial_starts_s' not in p or 'trial_duration_s' not in p:
+        return None
+    if 'cs_neuron_inds' not in p or 'us_neuron_inds' not in p:
+        return None
+    cs_set = set(np.atleast_1d(p['cs_neuron_inds']))
+    us_set = set(np.atleast_1d(p['us_neuron_inds']))
+    n_exc = p['nExc']
+    ns_inds = np.array([i for i in range(n_exc) if i not in cs_set and i not in us_set])
+    if len(ns_inds) == 0:
+        return {
+            'mean_peak_time_s': np.nan,
+            'variance_peak_time_s': np.nan,
+            'peak_times_per_trial_s': np.array([]),
+            'n_ns_neurons': 0,
+        }
+
+    data, _ = compute_trial_binned_data(results, bin_size=bin_size, use_exc_only=True)
+    if data is None or data.size == 0:
+        return None
+    # data: (n_trials, n_timepoints, n_neurons); restrict to NS neurons
+    ns_data = data[:, :, ns_inds]  # (n_trials, n_timepoints, n_ns)
+    # Average across NS neurons: (n_trials, n_timepoints)
+    mean_fr_per_trial = np.mean(ns_data, axis=2)
+    bin_size_s = float(bin_size / second)
+    n_timepoints = mean_fr_per_trial.shape[1]
+    # Center of each bin within trial (s)
+    time_within_trial = (np.arange(n_timepoints) + 0.5) * bin_size_s
+
+    peak_bin_per_trial = np.nanargmax(mean_fr_per_trial, axis=1)
+    peak_times_per_trial_s = time_within_trial[peak_bin_per_trial]
+    valid = np.isfinite(peak_times_per_trial_s)
+    if np.any(valid):
+        mean_peak_time_s = float(np.mean(peak_times_per_trial_s))
+        variance_peak_time_s = float(np.var(peak_times_per_trial_s))
+    else:
+        mean_peak_time_s = np.nan
+        variance_peak_time_s = np.nan
+
+    return {
+        'mean_peak_time_s': mean_peak_time_s,
+        'variance_peak_time_s': variance_peak_time_s,
+        'peak_times_per_trial_s': peak_times_per_trial_s,
+        'n_ns_neurons': len(ns_inds),
+    }
+
+
+def compute_ns_trial_trajectories(results, bin_size=5*ms, n_components=3):
+    """
+    Project each trial's NS (non-stimulated) population activity into a shared PCA space
+    for comparing trial-to-trial trajectory similarity.
+
+    Requires params: trial_starts_s, trial_duration_s, trial_conditions, cs_neuron_inds, us_neuron_inds.
+
+    Returns
+    -------
+    projected_trials : ndarray, shape (n_trials, n_timepoints, n_components)
+        Each trial's NS trajectory in PCA space.
+    time_s : ndarray, shape (n_timepoints,)
+        Time within trial (s) for each bin.
+    conditions : ndarray, shape (n_trials,)
+        Condition label per trial ('CS' or 'US').
+    pca : sklearn PCA
+        Fitted PCA on (n_trials * n_timepoints, n_ns_neurons) NS data.
+    ns_inds : ndarray
+        Indices of NS neurons.
+    or (None, None, None, None, None) if trial/CS/US info missing or no NS neurons.
+    """
+    p = results.p
+    if 'trial_starts_s' not in p or 'trial_duration_s' not in p or 'trial_conditions' not in p:
+        return None, None, None, None, None
+    if 'cs_neuron_inds' not in p or 'us_neuron_inds' not in p:
+        return None, None, None, None, None
+    cs_set = set(np.atleast_1d(p['cs_neuron_inds']))
+    us_set = set(np.atleast_1d(p['us_neuron_inds']))
+    n_exc = p['nExc']
+    ns_inds = np.array([i for i in range(n_exc) if i not in cs_set and i not in us_set])
+    if len(ns_inds) == 0:
+        return None, None, None, None, None
+
+    data, conditions = compute_trial_binned_data(results, bin_size=bin_size, use_exc_only=True)
+    if data is None or data.size == 0:
+        return None, None, None, None, None
+    # data: (n_trials, n_timepoints, n_neurons); restrict to NS
+    ns_data = data[:, :, ns_inds]  # (n_trials, n_timepoints, n_ns)
+    n_trials, n_timepoints, n_ns = ns_data.shape
+
+    # Fit PCA on all NS activity (all trials, all timepoints)
+    X_all = ns_data.reshape(-1, n_ns)
+    n_components = min(n_components, n_ns, X_all.shape[0] - 1)
+    if n_components < 1:
+        return None, None, None, None, None
+    pca = PCA(n_components=n_components)
+    pca.fit(X_all)
+
+    # Project each trial
+    projected_trials = np.zeros((n_trials, n_timepoints, n_components))
+    for tr in range(n_trials):
+        projected_trials[tr] = pca.transform(ns_data[tr])
+
+    bin_size_s = float(bin_size / second)
+    time_s = (np.arange(n_timepoints) + 0.5) * bin_size_s
+    return projected_trials, time_s, conditions, pca, ns_inds
+
+
 def compute_block_weight_change(W_pre, W_post, groups, group_names=None):
     """
-    Block-averaged weight change: for each (post, pre) group pair, compute mean and SEM
+    Block-averaged weight change: for each (pre, post) connection block, compute mean and SEM
     of percentage change (W_post - W_pre) / W_pre * 100 over synapses with W_pre > 0.
+    Weight matrix convention: W[post, pre] = weight from pre to post.
 
-    groups: 1d array of length N, group index per neuron (0=CS, 1=US, 2=other, etc.)
-    group_names: optional list of names for labels (e.g. ['CS', 'US', 'other'])
-    Returns: labels (e.g. ['CS→CS', 'CS→US', ...]), means (%), sems (%).
+    groups: 1d array of length N, group index per neuron (0=CS, 1=US, 2=NS, etc.)
+    group_names: optional list of names for labels (e.g. ['CS', 'US', 'NS'])
+    Returns: labels as pre→post (e.g. ['CS→CS', 'CS→US', ...]), means (%), sems (%).
     """
     W_pre = np.asarray(W_pre)
     W_post = np.asarray(W_post)
@@ -306,7 +443,7 @@ def compute_block_weight_change(W_pre, W_post, groups, group_names=None):
                 means.append(float(np.mean(pct)))
                 n = len(pct)
                 sems.append(float(np.std(pct) / np.sqrt(n)) if n > 1 else 0.0)
-            labels.append(f"{group_names[i_post]}→{group_names[i_pre]}")
+            labels.append(f"{group_names[i_pre]}→{group_names[i_post]}")
     return labels, np.array(means), np.array(sems)
 
 
@@ -339,8 +476,8 @@ class SimpleResults:
             us_set = set(self.p['us_neuron_inds'])
             cs_sorted = np.sort(self.p['cs_neuron_inds'])
             us_sorted = np.sort(self.p['us_neuron_inds'])
-            other_sorted = np.sort([i for i in range(nExc) if i not in cs_set and i not in us_set])
-            order = np.concatenate([cs_sorted, us_sorted, other_sorted])
+            ns_sorted = np.sort([i for i in range(nExc) if i not in cs_set and i not in us_set])
+            order = np.concatenate([cs_sorted, us_sorted, ns_sorted])
             neuron_to_display = {n: i for i, n in enumerate(order)}
             nCS, nUS = len(cs_sorted), len(us_sorted)
             t_exc = np.asarray(self.spikeMonExcT)
@@ -352,7 +489,7 @@ class SimpleResults:
             ax.scatter(self.spikeMonInhT, nExc + self.spikeMonInhI, s=1, c='red', marker='.', linewidths=0)
             ax.axhline(nExc - 0.5, color='k', lw=0.5, linestyle='-')
             ax.set_ylim(-0.5, self.p['nUnits'] - 0.5)
-            ax.set_ylabel("Neuron (CS | US | other | inh)")
+            ax.set_ylabel("Neuron (CS | US | NS | inh)")
         else:
             ax.scatter(self.spikeMonExcT, self.spikeMonExcI, s=1, c='cyan', marker='.')
             ax.scatter(self.spikeMonInhT, nExc + self.spikeMonInhI, s=1, c='red', marker='.', linewidths=0)
@@ -393,7 +530,7 @@ class SimpleResults:
             cs_set = set(self.p['cs_neuron_inds'])
             us_set = set(self.p['us_neuron_inds'])
             nCS, nUS = len(cs_set), len(us_set)
-            nOther = nExc - nCS - nUS
+            nNS = nExc - nCS - nUS
             if nCS > 0:
                 mask_cs = np.isin(self.spikeMonExcI, self.p['cs_neuron_inds'])
                 t_cs = self.spikeMonExcT[mask_cs]
@@ -406,13 +543,13 @@ class SimpleResults:
                 FR_US, _ = np.histogram(t_us, bins)
                 FR_US = FR_US / bin_size_s / nUS
                 ax.plot(centers, FR_US, color='C0', alpha=0.8, label='US')
-            if nOther > 0:
-                other_set = set(range(nExc)) - cs_set - us_set
-                mask_other = np.isin(self.spikeMonExcI, np.array(list(other_set)))
-                t_other = self.spikeMonExcT[mask_other]
-                FR_other, _ = np.histogram(t_other, bins)
-                FR_other = FR_other / bin_size_s / nOther
-                ax.plot(centers, FR_other, color='0.6', alpha=0.6, label='other exc')
+            if nNS > 0:
+                ns_set = set(range(nExc)) - cs_set - us_set
+                mask_ns = np.isin(self.spikeMonExcI, np.array(list(ns_set)))
+                t_ns = self.spikeMonExcT[mask_ns]
+                FR_ns, _ = np.histogram(t_ns, bins)
+                FR_ns = FR_ns / bin_size_s / nNS
+                ax.plot(centers, FR_ns, color='0.6', alpha=0.6, label='NS')
             FRInh, _ = np.histogram(self.spikeMonInhT, bins)
             FRInh = FRInh / bin_size_s / nInh
             ax.plot(centers, FRInh, color='red', alpha=0.6, label='inh')
@@ -464,7 +601,7 @@ class SimpleResults:
         ax.set_ylabel("Voltage (mV)")
 
     def plot_voltage_by_groups(self, ax=None, use_sem=True):
-        """Plot mean voltage ± error (SEM or SD) for each group (CS, US, other exc, inh) on one axes."""
+        """Plot mean voltage ± error (SEM or SD) for each group (CS, US, NS, inh) on one axes."""
         V_exc = np.asarray(self.stateMonExcV)
         V_inh = np.asarray(self.stateMonInhV)
         t = self.stateMonT
@@ -500,10 +637,10 @@ class SimpleResults:
             cs_inds = np.atleast_1d(self.p['cs_neuron_inds'])
             us_inds = np.atleast_1d(self.p['us_neuron_inds'])
             nExc = self.p['nExc']
-            other_inds = np.array([i for i in range(nExc) if i not in cs_inds and i not in us_inds])
+            ns_inds = np.array([i for i in range(nExc) if i not in cs_inds and i not in us_inds])
             plot_group(cs_inds, V_exc, rec_exc, 'C3', 'CS')
             plot_group(us_inds, V_exc, rec_exc, 'C0', 'US')
-            plot_group(other_inds, V_exc, rec_exc, '0.6', 'other exc')
+            plot_group(ns_inds, V_exc, rec_exc, '0.6', 'NS')
             plot_group(rec_inh, V_inh, rec_inh, 'red', 'inh')
         else:
             plot_group(rec_exc, V_exc, rec_exc, 'cyan', 'exc')
@@ -583,9 +720,9 @@ class SimpleResults:
         if cor is None:
             ax.set_title("Within / between correlation (CS/US not defined)")
             return ax
-        labels = ['within CS', 'within US', 'within other', 'between CS–US', 'between CS–other', 'between US–other']
-        values = [cor['within_CS'], cor['within_US'], cor['within_other'],
-                  cor['between_CS_US'], cor['between_CS_other'], cor['between_US_other']]
+        labels = ['within CS', 'within US', 'within NS', 'between CS–US', 'between CS–NS', 'between US–NS']
+        values = [cor['within_CS'], cor['within_US'], cor['within_NS'],
+                  cor['between_CS_US'], cor['between_CS_NS'], cor['between_US_NS']]
         colors = ['C3', 'C0', '0.6', 'purple', 'brown', 'green']
         x = np.arange(len(labels))
         ax.bar(x, values, color=colors)
@@ -681,10 +818,110 @@ class SimpleResults:
             created_fig.tight_layout()
         return created_fig
 
+    def get_ns_peak_firing_stats(self, bin_size=5*ms):
+        """
+        Optionally measure peak average firing time and its variance for the non-stimulated (NS)
+        excitatory neuron group across trials.
+
+        For each trial, the time (within trial) at which the trial-averaged NS firing rate is
+        maximum is recorded; returns the mean and variance of those peak times across trials.
+
+        Returns
+        -------
+        dict or None
+            Keys: mean_peak_time_s, variance_peak_time_s, peak_times_per_trial_s, n_ns_neurons.
+            None if trial info or CS/US indices are missing.
+        """
+        return compute_ns_peak_firing_stats(self, bin_size=bin_size)
+
+    def plot_ns_trial_trajectories(self, bin_size=5*ms, n_components=3, ax_2d=None, ax_3d=None,
+                                   color_by_time=True, cmap='viridis', alpha=0.75, linewidth=1.2):
+        """
+        Plot each trial's NS population trajectory in PCA space to compare trial-to-trial similarity.
+        Trajectories are overlaid; color indicates time within trial (early→late) so direction is visible.
+        Similar trials will overlap; different trials will diverge.
+
+        Parameters
+        ----------
+        bin_size : Quantity
+            Time bin for binned firing rates.
+        n_components : int
+            Number of PCA components (2 or 3 for plotting).
+        ax_2d, ax_3d : matplotlib axes, optional
+            If provided, draw in these axes (ax_2d = PC1 vs PC2, ax_3d = 3D). If both None, create a figure with 2 panels.
+        color_by_time : bool
+            If True, color trajectory by time within trial; else use a single color per trial.
+        cmap : str
+            Colormap name for time (e.g. 'viridis', 'plasma').
+        alpha, linewidth : float
+            Line transparency and width.
+
+        Returns
+        -------
+        fig or None
+            The figure if one was created, else None.
+        """
+        out = compute_ns_trial_trajectories(self, bin_size=bin_size, n_components=max(n_components, 2))
+        projected_trials, time_s, conditions, pca, ns_inds = out
+        if projected_trials is None or pca is None:
+            return None
+        n_trials, n_timepoints, nc = projected_trials.shape
+        if nc < 2:
+            return None
+
+        create_fig = (ax_2d is None and ax_3d is None)
+        if create_fig:
+            fig = plt.figure(figsize=(12, 5))
+            ax_2d = fig.add_subplot(1, 2, 1)
+            ax_3d = fig.add_subplot(1, 2, 2, projection='3d')
+            fig_out = fig
+        else:
+            fig_out = None
+            if ax_2d is None:
+                ax_2d = plt.gca()
+            if ax_3d is None:
+                ax_3d = None
+
+        norm = Normalize(vmin=time_s.min(), vmax=time_s.max())
+        cmap_obj = plt.get_cmap(cmap)
+
+        for tr in range(n_trials):
+            proj = projected_trials[tr]  # (n_timepoints, n_components)
+            for t in range(n_timepoints - 1):
+                c = cmap_obj(norm((time_s[t] + time_s[t + 1]) / 2)) if color_by_time else '0.5'
+                ax_2d.plot(proj[t:t + 2, 0], proj[t:t + 2, 1], color=c, alpha=alpha, lw=linewidth)
+            if ax_3d is not None and nc >= 3:
+                for t in range(n_timepoints - 1):
+                    c = cmap_obj(norm((time_s[t] + time_s[t + 1]) / 2)) if color_by_time else '0.5'
+                    ax_3d.plot(proj[t:t + 2, 0], proj[t:t + 2, 1], proj[t:t + 2, 2], color=c, alpha=alpha, lw=linewidth)
+
+        ax_2d.set_xlabel("PC1 (NS)")
+        ax_2d.set_ylabel("PC2 (NS)")
+        ax_2d.set_title("NS population trajectory (each line = one trial)")
+        ax_2d.set_aspect('equal', adjustable='datalim')
+        ax_2d.axhline(0, color='k', lw=0.3, alpha=0.5)
+        ax_2d.axvline(0, color='k', lw=0.3, alpha=0.5)
+        if color_by_time:
+            sm = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
+            sm.set_array([])
+            plt.colorbar(sm, ax=ax_2d, shrink=0.7, label="Time in trial (s)")
+
+        if ax_3d is not None and nc >= 3:
+            ax_3d.set_xlabel("PC1 (NS)")
+            ax_3d.set_ylabel("PC2 (NS)")
+            ax_3d.set_zlabel("PC3 (NS)")
+            ax_3d.set_title("NS trajectory 3D (each line = one trial)")
+            if color_by_time:
+                plt.colorbar(sm, ax=ax_3d, shrink=0.6, label="Time in trial (s)")
+
+        if create_fig and fig_out is not None:
+            fig_out.tight_layout()
+        return fig_out
+
     def plot_weight_change_blocks(self, ax=None):
         """
         Bar graph of mean ± SEM percentage weight change by block (CS→CS, CS→US, US→CS, US→US, etc.)
-        Uses EE block only with groups CS, US, other. Requires weight_matrix_pre/post and cs/us_neuron_inds.
+        Uses EE block only with groups CS, US, NS. Requires weight_matrix_pre/post and cs/us_neuron_inds.
         Returns the figure if one was created, else None.
         """
         if 'weight_matrix_pre' not in self.p or 'weight_matrix_post' not in self.p:
@@ -699,12 +936,12 @@ class SimpleResults:
         W_post_EE = W_post[:nExc, :nExc]
         cs_inds = np.atleast_1d(self.p['cs_neuron_inds'])
         us_inds = np.atleast_1d(self.p['us_neuron_inds'])
-        other_inds = np.array([i for i in range(nExc) if i not in cs_inds and i not in us_inds])
+        ns_inds = np.array([i for i in range(nExc) if i not in cs_inds and i not in us_inds])
         groups = np.zeros(nExc, dtype=int)
         groups[cs_inds] = 0
         groups[us_inds] = 1
-        groups[other_inds] = 2
-        group_names = ['CS', 'US', 'other']
+        groups[ns_inds] = 2
+        group_names = ['CS', 'US', 'NS']
         labels, means, sems = compute_block_weight_change(
             W_pre_EE, W_post_EE, groups, group_names=group_names
         )
@@ -727,8 +964,9 @@ class SimpleResults:
 
 def plot_all_figures(results, show=True):
     """
-    Create the standard four poster figures from a SimpleResults instance.
-    Returns (fig1, fig2, fig3, fig4). If show is True, calls plt.show() at the end.
+    Create the standard poster figures from a SimpleResults instance.
+    Returns (fig1, fig2, fig3, fig4, fig5). If show is True, calls plt.show() at the end.
+    fig5: NS population trial trajectories (per-trial PCA trajectory overlay).
     """
     # Figure 1: raster, firing rate, voltage
     fig1 = plt.figure(figsize=(8, 10))
@@ -761,7 +999,12 @@ def plot_all_figures(results, show=True):
     if fig4 is not None:
         fig4.tight_layout()
 
+    # Figure 5: NS population trial trajectories (compare trial-to-trial similarity)
+    fig5 = results.plot_ns_trial_trajectories(bin_size=5*ms, n_components=3)
+    if fig5 is not None:
+        fig5.tight_layout()
+
     if show:
         plt.show()
-    return fig1, fig2, fig3, fig4
+    return fig1, fig2, fig3, fig4, fig5
 

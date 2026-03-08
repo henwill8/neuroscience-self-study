@@ -36,6 +36,12 @@ def _run_network(params, rng, show_plots=True):
     results = SimpleResults(
         spikeMonExc, spikeMonInh, stateMonExc, stateMonInh, params
     )
+    if params.get('measure_ns_peak_firing', False):
+        stats = results.get_ns_peak_firing_stats()
+        if stats is not None:
+            results.p['ns_peak_firing_stats'] = stats
+            print(f"NS (non-stimulated) excitatory: mean peak time = {stats['mean_peak_time_s']:.4f} s, "
+                  f"variance = {stats['variance_peak_time_s']:.6f} s² (n_ns = {stats['n_ns_neurons']})")
     if show_plots:
         plot_all_figures(results, show=True)
     return params, results
@@ -106,6 +112,23 @@ def run_continue_custom(show_plots=True):
     params['load_checkpoint_path'] = "results/network_checkpoint.pkl"
     params['nTrials'] = 10
     params['checkpoint_path'] = 'results/continued_experiment.pkl'
+    derive_trial_params(params)
+    return _run_network(params, rng, show_plots=show_plots)
+
+
+@_register("ns_perturb_trial0", "Temporary test: perturb NS neurons on first trial 0.2 s after start.")
+def run_ns_perturb_trial0(show_plots=True):
+    """
+    Perturb all NS (non-stimulated) neurons with a single pulse 0.2 s after trial 0 start.
+    Uses same current amplitude as CS/US by default. Compare NS trajectories with/without.
+    """
+    seed(42)
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    params = get_default_params()
+    params['ns_perturbation_trial'] = 0
+    params['ns_perturbation_t_s'] = 0.2  # seconds after trial 0 start
+    params['ns_perturbation_amplitude'] = 0.2  # nA; optional, defaults to spikeInputAmplitude
     derive_trial_params(params)
     return _run_network(params, rng, show_plots=show_plots)
 
