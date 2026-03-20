@@ -1,1 +1,3 @@
 *.code-workspace
+/Spring 2026 Poster/__pycache__
+/Spring 2026 Poster/neural_ensembles/__pycache__

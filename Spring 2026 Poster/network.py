@@ -98,26 +98,63 @@ class Network:
     def _build_neurons(self):
         p = self.params
         rng = self.rng
+        use_istdp = p.get('use_istdp', False)
+        use_adaptation = p.get('use_adaptation', True)
 
-        unitModel = '''
-            dv/dt = (gl * (eLeak - v) - iAdapt +
-                     sE - sI + sExt) / Cm +
-                     noiseSigma * (Cm / gl)**-0.5 * xi: volt (unless refractory)
-            diAdapt/dt = -iAdapt / tauAdapt : amp
-            dsE/dt = (-sE + uE) / tauFallE : amp
-            duE/dt = -uE / tauRiseE : amp
-            dsI/dt = (-sI + uI) / tauFallI : amp
-            duI/dt = -uI / tauRiseI : amp
-            dsExt/dt = (-sExt + uExt) / tauFallE : amp
-            duExt/dt = -uExt / tauRiseE : amp
-            eLeak : volt
-            vReset : volt
-            vThresh : volt
-            betaAdapt : amp * second
-            gl : siemens
-            Cm : farad
-        '''
-        resetCode = 'v = vReset; iAdapt += betaAdapt / tauAdapt'
+        if use_adaptation:
+            unitModelBase = '''
+                dv/dt = (gl * (eLeak - v) - iAdapt +
+                         sE - sI + sExt) / Cm +
+                         noiseSigma * (Cm / gl)**-0.5 * xi: volt (unless refractory)
+                diAdapt/dt = -iAdapt / tauAdapt : amp
+                dsE/dt = (-sE + uE) / tauFallE : amp
+                duE/dt = -uE / tauRiseE : amp
+                dsI/dt = (-sI + uI) / tauFallI : amp
+                duI/dt = -uI / tauRiseI : amp
+                dsExt/dt = (-sExt + uExt) / tauFallE : amp
+                duExt/dt = -uExt / tauRiseE : amp
+                eLeak : volt
+                vReset : volt
+                vThresh : volt
+                betaAdapt : amp * second
+                gl : siemens
+                Cm : farad
+            '''
+            resetBase = 'v = vReset; iAdapt += betaAdapt / tauAdapt'
+        else:
+            unitModelBase = '''
+                dv/dt = (gl * (eLeak - v) + sE - sI + sExt) / Cm +
+                         noiseSigma * (Cm / gl)**-0.5 * xi: volt (unless refractory)
+                dsE/dt = (-sE + uE) / tauFallE : amp
+                duE/dt = -uE / tauRiseE : amp
+                dsI/dt = (-sI + uI) / tauFallI : amp
+                duI/dt = -uI / tauRiseI : amp
+                dsExt/dt = (-sExt + uExt) / tauFallE : amp
+                duExt/dt = -uExt / tauRiseE : amp
+                eLeak : volt
+                vReset : volt
+                vThresh : volt
+                betaAdapt : amp * second
+                gl : siemens
+                Cm : farad
+            '''
+            resetBase = 'v = vReset'
+
+        if use_istdp:
+            unitModelExc = unitModelBase.strip() + '''
+            dyE/dt = -yE / tau_y : 1
+            '''
+            unitModelInh = unitModelBase.strip() + '''
+            dyI/dt = -yI / tau_y : 1
+            '''
+            resetCodeExc = resetBase + '; yE += 1'
+            resetCodeInh = resetBase + '; yI += 1'
+        else:
+            unitModelExc = unitModelBase
+            unitModelInh = unitModelBase
+            resetCodeExc = resetBase
+            resetCodeInh = resetBase
+
         threshCode = 'v >= vThresh'
 
         p['nInh'] = int(p['propInh'] * p['nUnits'])
@@ -132,23 +169,25 @@ class Network:
             'tauAdapt': p['adaptTau'],
             'noiseSigma': p['noiseSigma'],
         }
+        if use_istdp:
+            neuron_namespace['tau_y'] = p['tau_y']
 
         self._unitsExc = NeuronGroup(
             N=p['nExc'],
-            model=unitModel,
+            model=unitModelExc,
             method='euler',
             threshold=threshCode,
-            reset=resetCode,
+            reset=resetCodeExc,
             refractory=p['refrExc'],
             clock=defaultclock,
             namespace=neuron_namespace,
         )
         self._unitsInh = NeuronGroup(
             N=p['nInh'],
-            model=unitModel,
+            model=unitModelInh,
             method='euler',
             threshold=threshCode,
-            reset=resetCode,
+            reset=resetCodeInh,
             refractory=p['refrInh'],
             clock=defaultclock,
             namespace=neuron_namespace,
@@ -252,6 +291,39 @@ class Network:
                 )
                 self._syn_NS_perturb.connect(i=np.arange(n_ns), j=ns_inds)
 
+        # Optional: transient kick to random small % of excitatory neurons (to probe up-state initiation / structured spontaneity)
+        self._upstate_kick_group = None
+        self._syn_upstate_kick = None
+        kick_t = p.get('upstate_kick_t_s')
+        if kick_t is not None and p['nExc'] > 0:
+            rng = self.rng
+            fraction = float(p.get('upstate_kick_fraction', 0.02))
+            n_kick = max(1, min(p['nExc'], int(round(p['nExc'] * fraction))))
+            kick_neurons = rng.choice(p['nExc'], size=n_kick, replace=False)
+            amp = float(p.get('upstate_kick_amplitude', p['spikeInputAmplitude']))
+            n_pulses = int(p.get('upstate_kick_n_pulses', 1))
+            kick_Hz = float(p.get('upstate_kick_Hz', 50))
+            if n_pulses <= 1:
+                indices = np.arange(n_kick)
+                times = np.full(n_kick, kick_t)
+            else:
+                pulse_times = kick_t + np.arange(n_pulses) / kick_Hz
+                indices = np.repeat(np.arange(n_kick), n_pulses)
+                times = np.tile(pulse_times, n_kick)
+            self._upstate_kick_group = SpikeGeneratorGroup(
+                n_kick,
+                indices,
+                times * second,
+            )
+            self._syn_upstate_kick = Synapses(
+                self._upstate_kick_group,
+                self._unitsExc,
+                on_pre='uExt_post += ' + str(amp) + ' * nA',
+            )
+            self._syn_upstate_kick.connect(i=np.arange(n_kick), j=kick_neurons)
+            p['upstate_kick_neuron_inds'] = kick_neurons
+            p['upstate_kick_n'] = n_kick
+
     def _build_recurrent_synapses(self):
         p = self.params
         rng = self.rng
@@ -262,6 +334,7 @@ class Network:
         tauRiseIOverMS = p['tauRiseInh'] / ms
         syn_namespace = {'tauRiseEOverMS': tauRiseEOverMS, 'tauRiseIOverMS': tauRiseIOverMS}
 
+        use_homeostatic = p.get('use_homeostatic_norm', False) and p.get('homeostatic_norm_period') is not None
         if p.get('use_stdp', False):
             eqs_EE = '''
                 jEE : amp
@@ -269,6 +342,8 @@ class Network:
                 dapre/dt = -apre / tau_stdp_pre : 1 (event-driven)
                 dapost/dt = -apost / tau_stdp_post : 1 (event-driven)
             '''
+            if use_homeostatic:
+                eqs_EE = eqs_EE.strip() + '\n                jEE_start : amp (constant)'
             on_pre_EE = '''
                 uE_post += jEE / tauRiseEOverMS
                 apre += 1
@@ -286,6 +361,8 @@ class Network:
             preInds, postInds = adjacency_indices_within(p['nExc'], p['propConnect'], rng)
             synapsesEE.connect(i=preInds, j=postInds)
             synapsesEE.jEE = normal_weights(p['jEE'], len(synapsesEE), p['weightCV'], rng)
+            if use_homeostatic:
+                synapsesEE.jEE_start = synapsesEE.jEE[:]
             synapsesEE.use_stdp = _ee_stdp_use_flags(
                 preInds, postInds,
                 p['cs_neuron_inds'], p['us_neuron_inds'],
@@ -302,8 +379,11 @@ class Network:
                 'w_max_EE': p['w_max_EE'],
             })
         else:
+            eqs_EE_simple = 'jEE : amp'
+            if use_homeostatic:
+                eqs_EE_simple += '\njEE_start : amp (constant)'
             synapsesEE = Synapses(
-                model='jEE: amp',
+                model=eqs_EE_simple,
                 source=unitsExc, target=unitsExc,
                 on_pre='uE_post += jEE / tauRiseEOverMS',
                 namespace=dict(syn_namespace),
@@ -311,13 +391,39 @@ class Network:
             preInds, postInds = adjacency_indices_within(p['nExc'], p['propConnect'], rng)
             synapsesEE.connect(i=preInds, j=postInds)
             synapsesEE.jEE = normal_weights(p['jEE'], len(synapsesEE), p['weightCV'], rng)
+            if use_homeostatic:
+                synapsesEE.jEE_start = synapsesEE.jEE[:]
 
-        synapsesEI = Synapses(
-            model='jEI: amp',
-            source=unitsInh, target=unitsExc,
-            on_pre='uI_post += jEI / tauRiseIOverMS',
-            namespace=dict(syn_namespace),
-        )
+        if p.get('use_istdp', False):
+            # iSTDP: presynaptic (I) spike -> jEI += Z*(yE_post - 2*r0*tau_y); postsynaptic (E) spike -> jEI += Z*yI_pre
+            two_r0_tau_y = 2.0 * float(p['r0'] / Hz) * float(p['tau_y'] / second)
+            istdp_namespace = dict(syn_namespace)
+            istdp_namespace.update({
+                'Z_istdp': p['Z'],
+                'two_r0_tau_y': two_r0_tau_y,
+                'J_EI_min': p['J_EI_min'],
+                'J_EI_max': p['J_EI_max'],
+            })
+            on_pre_EI = '''
+                uI_post += jEI / tauRiseIOverMS
+                jEI = clip(jEI + Z_istdp * (yE_post - two_r0_tau_y), J_EI_min, J_EI_max)
+            '''
+            on_post_EI = '''
+                jEI = clip(jEI + Z_istdp * yI_pre, J_EI_min, J_EI_max)
+            '''
+            synapsesEI = Synapses(
+                source=unitsInh, target=unitsExc,
+                model='jEI : amp',
+                on_pre=on_pre_EI, on_post=on_post_EI,
+                namespace=istdp_namespace,
+            )
+        else:
+            synapsesEI = Synapses(
+                model='jEI: amp',
+                source=unitsInh, target=unitsExc,
+                on_pre='uI_post += jEI / tauRiseIOverMS',
+                namespace=dict(syn_namespace),
+            )
         preInds, postInds = adjacency_indices_between(p['nInh'], p['nExc'], p['propConnect'], rng)
         synapsesEI.connect(i=preInds, j=postInds)
         synapsesEI.jEI = normal_weights(p['jEI'], len(synapsesEI), p['weightCV'], rng)
@@ -342,10 +448,11 @@ class Network:
         synapsesII.connect(i=preInds, j=postInds)
         synapsesII.jII = normal_weights(p['jII'], len(synapsesII), p['weightCV'], rng)
 
-        synapsesEE.delay = ((rng.random(synapsesEE.delay.shape[0]) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
-        synapsesEI.delay = ((rng.random(synapsesEI.delay.shape[0]) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
-        synapsesIE.delay = ((rng.random(synapsesIE.delay.shape[0]) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
-        synapsesII.delay = ((rng.random(synapsesII.delay.shape[0]) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        n_ee, n_ei, n_ie, n_ii = len(synapsesEE), len(synapsesEI), len(synapsesIE), len(synapsesII)
+        synapsesEE.delay = ((rng.random(n_ee) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        synapsesEI.delay = ((rng.random(n_ei) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        synapsesIE.delay = ((rng.random(n_ie) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        synapsesII.delay = ((rng.random(n_ii) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
 
         self._synapsesEE = synapsesEE
         self._synapsesEI = synapsesEI
@@ -373,6 +480,7 @@ class Network:
 
         # EE: W[0:nExc, 0:nExc]
         pre_ee, post_ee, w_ee = connect_from_block(W[0:nExc, 0:nExc])
+        use_homeostatic = p.get('use_homeostatic_norm', False) and p.get('homeostatic_norm_period') is not None
         if p.get('use_stdp', False):
             eqs_EE = '''
                 jEE : amp
@@ -380,6 +488,8 @@ class Network:
                 dapre/dt = -apre / tau_stdp_pre : 1 (event-driven)
                 dapost/dt = -apost / tau_stdp_post : 1 (event-driven)
             '''
+            if use_homeostatic:
+                eqs_EE = eqs_EE.strip() + '\n                jEE_start : amp (constant)'
             on_pre_EE = '''
                 uE_post += jEE / tauRiseEOverMS
                 apre += 1
@@ -396,6 +506,8 @@ class Network:
             )
             synapsesEE.connect(i=pre_ee, j=post_ee)
             synapsesEE.jEE = w_ee * amp  # checkpoint stores weights in SI (amperes)
+            if use_homeostatic:
+                synapsesEE.jEE_start = synapsesEE.jEE[:]
             synapsesEE.use_stdp = _ee_stdp_use_flags(
                 pre_ee, post_ee,
                 p['cs_neuron_inds'], p['us_neuron_inds'],
@@ -412,14 +524,19 @@ class Network:
                 'w_max_EE': p['w_max_EE'],
             })
         else:
+            eqs_EE_simple = 'jEE : amp'
+            if use_homeostatic:
+                eqs_EE_simple += '\njEE_start : amp (constant)'
             synapsesEE = Synapses(
-                model='jEE: amp',
+                model=eqs_EE_simple,
                 source=unitsExc, target=unitsExc,
                 on_pre='uE_post += jEE / tauRiseEOverMS',
                 namespace=dict(syn_namespace),
             )
             synapsesEE.connect(i=pre_ee, j=post_ee)
             synapsesEE.jEE = w_ee * amp  # checkpoint stores weights in SI (amperes)
+            if use_homeostatic:
+                synapsesEE.jEE_start = synapsesEE.jEE[:]
 
         # EI: W[0:nExc, nExc:nExc+nInh]
         pre_ei, post_ei, w_ei = connect_from_block(W[0:nExc, nExc : nExc + nInh])
@@ -455,10 +572,11 @@ class Network:
         synapsesII.jII = w_ii * amp  # checkpoint stores weights in SI (amperes)
 
         # Delays not stored in checkpoint; resample
-        synapsesEE.delay = ((rng.random(synapsesEE.delay.shape[0]) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
-        synapsesEI.delay = ((rng.random(synapsesEI.delay.shape[0]) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
-        synapsesIE.delay = ((rng.random(synapsesIE.delay.shape[0]) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
-        synapsesII.delay = ((rng.random(synapsesII.delay.shape[0]) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        n_ee, n_ei, n_ie, n_ii = len(synapsesEE), len(synapsesEI), len(synapsesIE), len(synapsesII)
+        synapsesEE.delay = ((rng.random(n_ee) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        synapsesEI.delay = ((rng.random(n_ei) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        synapsesIE.delay = ((rng.random(n_ie) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
+        synapsesII.delay = ((rng.random(n_ii) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
 
         self._synapsesEE = synapsesEE
         self._synapsesEI = synapsesEI
@@ -517,6 +635,40 @@ class Network:
 
         self._build_monitors()
 
+        # Homeostatic normalization: scale EE weights per post so total input strength
+        # sum(jEE) = sum(jEE_start), enabling competition. Fully vectorized (no Python loop over neurons).
+        homeostatic_op = None
+        if (p.get('use_homeostatic_norm', False) and p.get('homeostatic_norm_period') is not None
+                and hasattr(self._synapsesEE, 'jEE_start')):
+            period = p['homeostatic_norm_period']
+            nExc = p['nExc']
+            j_unit = self._synapsesEE.jEE.unit
+
+            def _homeostatic_ee_norm():
+                syn = self._synapsesEE
+
+                post_inds = np.asarray(syn.j)
+                j_cur = np.asarray(syn.jEE)
+                j_start = np.asarray(syn.jEE_start)
+
+                # current and initial totals per postsynaptic neuron
+                sum_cur = np.bincount(post_inds, weights=j_cur, minlength=nExc)
+                sum_start = np.bincount(post_inds, weights=j_start, minlength=nExc)
+
+                # number of synapses per post neuron
+                counts = np.bincount(post_inds, minlength=nExc)
+
+                # amount to subtract per synapse in that row
+                delta = np.zeros(nExc)
+                np.divide(sum_cur - sum_start, counts, where=counts > 0, out=delta)
+
+                # subtract from each synapse
+                new_j = j_cur - delta[post_inds]
+
+                syn.jEE[:] = new_j * j_unit
+
+            homeostatic_op = network_operation(dt=period, when='start')(_homeostatic_ee_norm)
+
         # Brian2's magic run() only collects objects in the current namespace; our objects
         # live on self, so they are never included. Use an explicit Network and add all objects.
         b2_objects = [
@@ -535,8 +687,12 @@ class Network:
             self._stateMonExc,
             self._stateMonInh,
         ]
+        if homeostatic_op is not None:
+            b2_objects.append(homeostatic_op)
         if self._NS_perturb_group is not None and self._syn_NS_perturb is not None:
             b2_objects.extend([self._NS_perturb_group, self._syn_NS_perturb])
+        if self._upstate_kick_group is not None and self._syn_upstate_kick is not None:
+            b2_objects.extend([self._upstate_kick_group, self._syn_upstate_kick])
         b2_net = B2Network(*b2_objects)
         b2_net.run(p['duration'], report=p['reportType'], report_period=p['reportPeriod'], profile=p['doProfile'])
 

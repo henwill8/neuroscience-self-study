@@ -7,7 +7,7 @@ Run with:  python experiments.py [--list] [experiment_name ...]
           python experiments.py --list
 """
 import argparse
-from brian2 import seed
+from brian2 import seed, second
 import numpy as np
 
 from config import get_default_params, derive_trial_params
@@ -131,6 +131,37 @@ def run_ns_perturb_trial0(show_plots=True):
     params['ns_perturbation_amplitude'] = 0.2  # nA; optional, defaults to spikeInputAmplitude
     derive_trial_params(params)
     return _run_network(params, rng, show_plots=show_plots)
+
+
+@_register("upstate_kick", "Transient kick to random small % of E neurons to probe up-state initiation and structured spontaneity.")
+def run_upstate_kick(show_plots=True):
+    """
+    Spontaneous activity only: no CS/US trials. Deliver a brief external kick to a random 2%
+    of excitatory neurons at a fixed time (after a short baseline). Goal: see whether the kick
+    can initiate an up state and whether subsequent activity is structured or unstructured.
+    """
+    seed(43)
+    np.random.seed(43)
+    rng = np.random.default_rng(43)
+    params = get_default_params()
+    # No trials — spontaneous activity only, then one kick
+    params['nTrials'] = 0
+    params['include_CS_only_trial'] = False
+    derive_trial_params(params)
+    # Explicit duration (derive_trial_params would give invalid duration when nTrials=0)
+    params['duration'] = 5 * second  # ~2 s baseline, kick at 2 s, ~3 s to observe response
+    # Kick after ~2 s baseline
+    params['upstate_kick_t_s'] = 2.0
+    params['upstate_kick_fraction'] = 0.02   # 2% of E neurons
+    params['upstate_kick_amplitude'] = 0.5   # nA (strong enough to depolarize)
+    params['upstate_kick_n_pulses'] = 5      # short train at 50 Hz
+    params['upstate_kick_Hz'] = 50.0
+    params['save_checkpoint'] = False
+    params['load_checkpoint_path'] = 'results/istdp_network_checkpoint.pkl'
+    params, results = _run_network(params, rng, show_plots=show_plots)
+    if params.get('upstate_kick_n'):
+        print(f"Up-state kick: {params['upstate_kick_n']} neurons at t={params.get('upstate_kick_t_s', '?')} s")
+    return params, results
 
 
 # ---------------------------------------------------------------------------

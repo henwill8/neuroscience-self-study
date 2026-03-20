@@ -20,7 +20,7 @@ def derive_trial_params(params):
 def get_default_params():
     """Return the default params dict with trial duration and simulation length derived."""
     params = {
-        'dt': 0.05 * ms,
+        'dt': 0.1 * ms,
 
         'reportType': 'stdout',
         'reportPeriod': 10 * second,
@@ -29,13 +29,13 @@ def get_default_params():
         # -------------------------------------------------------------------------
         # CS-US training (red = CS, blue = US; paper: 440 ms red @ 25 Hz, 80 ms blue @ 50 Hz)
         # -------------------------------------------------------------------------
-        'nTrials': 3,
+        'nTrials': 30,
         'ISI': 360 * ms,              # time from CS onset to US onset (inter-stimulus interval)
         'propCS': 0.05,               # fraction of excitatory neurons selected for CS (red)
         'propUS': 0.05,               # fraction of excitatory neurons selected for US (blue)
-        'interTrialInterval': 2 * second,
+        'interTrialInterval': 1 * second,
         'include_CS_only_trial': True,   # if True, add one extra trial with CS only (no US)
-        'cs_only_every_n_trials': None,    # if int (e.g. 5), every nth trial is CS only (no US) to probe training
+        'cs_only_every_n_trials': 10,    # if int (e.g. 5), every nth trial is CS only (no US) to probe training
         'CS_train_duration': 440 * ms,
         'CS_Hz': 25 * Hz,
         'US_train_duration': 80 * ms,
@@ -73,6 +73,7 @@ def get_default_params():
         'gLeakInh': 8 * nS,
 
         'adaptTau': 500 * ms,
+        'use_adaptation': True,   # if False, no adaptation current (iAdapt) in unit model
 
         'noiseSigma': 1 * mV,
 
@@ -91,24 +92,31 @@ def get_default_params():
         # Keys: CS_CS, CS_US, CS_NS, US_CS, US_US, US_NS, NS_CS, NS_US, NS_NS.
         # Default: STDP only on connections where CS is presynaptic (CS_CS, CS_US, CS_NS).
         # -------------------------------------------------------------------------
-        'use_stdp': False,
-        'stdp_blocks': {
-            'CS_CS': False,
-            'CS_US': False,
-            'CS_NS': False,
-            'US_CS': False,
-            'US_US': False,
-            'US_NS': False,
-            'NS_CS': False,
-            'NS_US': True,
-            'NS_NS': False,
-        },
+        'use_stdp': True,
+        'stdp_blocks': None,
         'tau_stdp_pre': 20 * ms,
         'tau_stdp_post': 20 * ms,
         'A_plus_stdp': 5 * pA,   # LTP when pre before post
         'A_minus_stdp': 5 * pA,  # LTD when post before pre
         'w_min_EE': 0 * pA,
         'w_max_EE': 500 * pA,
+
+        # -------------------------------------------------------------------------
+        # Inhibitory STDP (iSTDP) for I->E synapses
+        # -------------------------------------------------------------------------
+        'use_istdp': False,
+        'tau_y': 20 * ms,       # time constant of low-pass spike trace
+        'r0': 3 * Hz,           # target firing rate of excitatory neuron
+        'Z': 1 * pA,            # learning rate scaling
+        'J_EI_min': 0 * pA,
+        'J_EI_max': 500 * pA,
+
+        # -------------------------------------------------------------------------
+        # Homeostatic normalization of EE weights (keeps total input strength per
+        # neuron constant for synaptic competition). Set use_homeostatic_norm=False to disable.
+        # -------------------------------------------------------------------------
+        'use_homeostatic_norm': True,
+        'homeostatic_norm_period': 20 * ms,
 
         # -------------------------------------------------------------------------
         # Synaptic dynamics and delays
@@ -132,8 +140,8 @@ def get_default_params():
         # I dont think this one is working
         'n_record_voltage': 100,   # how many neurons per population to record (None = all)
 
-        'save_checkpoint': False,  # when True, save weights to checkpoint_path
-        'checkpoint_path': 'results/360_long_stdp_network_checkpoint.pkl',
+        'save_checkpoint': True,  # when True, save weights to checkpoint_path
+        'checkpoint_path': 'results/istdp_network_checkpoint.pkl',
         'load_checkpoint_path': None,  # if set, load weights from this file (params from get_default_params / overrides)
         # 'load_checkpoint_path': 'results/360_long_stdp_network_checkpoint.pkl',
     }
