@@ -1,6 +1,6 @@
 """
 Build the Litwin-Kumar & Doiron style network: AdEx E, LIF I, conductance synapses,
-Clopath STDP (EE), row-sum normalization, iSTDP (EI), and Poisson drive.
+triplet STDP (EE), row-sum normalization, iSTDP (EI), and Poisson drive.
 """
 from brian2 import *
 import numpy as np
@@ -18,14 +18,11 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     delay_min = float(p.get('delay_min', 0*ms) / second)
     delay_max = float(p.get('delay_max', 1.5*ms) / second)
 
-    # ----- Excitatory: AdEx with adaptive threshold (V_T + A_T, tau_T) and Clopath traces -----
+    # ----- Excitatory: AdEx with adaptive threshold (V_T + A_T, tau_T) -----
     adex_eqs = '''
         dv/dt = (g_L_E*(E_L_E - v) + g_L_E*Delta_T*exp((v - V_T_E)/Delta_T) - w + I_syn + I_ext) / C_E : volt
         dw/dt = (a_w*(v - E_L_E) - w) / tau_w : amp
         dV_thresh/dt = (V_T_E - V_thresh) / tau_T : volt
-        v_at_spike : volt
-        du/dt = (v - u) / tau_u : volt
-        du_bar/dt = (v - u_bar) / tau_u_bar : volt
         dyE/dt = -yE / tau_y : 1
         dI_ext/dt = -I_ext / tau_ext : amp
         I_syn = g_E*(E_E - v) + g_I*(E_I - v) : amp
@@ -37,7 +34,7 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     # Reset: v to V_reset_E (Vre), w, yE; adaptive threshold reset to V_T_E + A_T; refractory t_abs
     V_reset_E = p.get('V_reset_E', -60*mV)
     refractory_E = p.get('refractory_E', 1*ms)
-    reset_adex = 'v_at_spike = v; v = V_reset_E; w += b_w; yE += 1; V_thresh = V_T_E + A_T'
+    reset_adex = 'v = V_reset_E; w += b_w; yE += 1; V_thresh = V_T_E + A_T'
     E_group = NeuronGroup(
         N_E,
         adex_eqs,
@@ -63,8 +60,6 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
             'tau_d_E': p['tau_d_E'],
             'tau_r_I': p['tau_r_I'],
             'tau_d_I': p['tau_d_I'],
-            'tau_u': p['tau_u'],
-            'tau_u_bar': p['tau_u_bar'],
             'tau_y': p['tau_y'],
             'tau_ext': p.get('tau_ext', 2 * ms),
         },
@@ -72,9 +67,6 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     E_group.v = p['E_L_E']
     E_group.w = 0 * amp
     E_group.V_thresh = p['V_T_E']
-    E_group.v_at_spike = p['E_L_E']
-    E_group.u = p['E_L_E']
-    E_group.u_bar = p['E_L_E']
     E_group.yE = 0.0
     E_group.g_E = 0 * nS
     E_group.h_E = 0 * nS
@@ -147,28 +139,40 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     no_aut_ii = i_ii != j_ii
     i_ii, j_ii = i_ii[no_aut_ii], j_ii[no_aut_ii]
 
-    # ----- EE synapses: conductance + Clopath STDP -----
-    theta_LTD = p['theta_LTD']
-    theta_LTP = p['theta_LTP']
-    A_LTD = p['A_LTD']
-    A_LTP = p['A_LTP']
-    tau_x = p['tau_x']
+    # ----- EE synapses: conductance + triplet STDP (Pfister-Gerstner style) -----
+    # Traces:
+    # r1/r2: pre traces (fast/slow), o1/o2: post traces (fast/slow)
+    # on_pre: LTD
+    # on_post: LTP
+    tau_plus = p['triplet_tau_plus']
+    tau_minus = p['triplet_tau_minus']
+    tau_x = p['triplet_tau_x']
+    tau_y_triplet = p['triplet_tau_y']
+    A2_minus = p['triplet_A2_minus']
+    A3_minus = p['triplet_A3_minus']
+    A2_plus = p['triplet_A2_plus']
+    A3_plus = p['triplet_A3_plus']
     J_EE_min = p['J_EE_min']
     J_EE_max = p['J_EE_max']
 
     ee_model = '''
         g_EE : siemens
-        dx/dt = -x / tau_x : 1 (event-driven)
+        dr1/dt = -r1 / tau_plus : 1 (event-driven)
+        dr2/dt = -r2 / tau_x : 1 (event-driven)
+        do1/dt = -o1 / tau_minus : 1 (event-driven)
+        do2/dt = -o2 / tau_y_triplet : 1 (event-driven)
         plasticity_on : 1 (constant)
     '''
     ee_on_pre = '''
         h_E_post += g_EE
-        x += 1
-        g_EE = clip(g_EE - plasticity_on * A_LTD * clip((u_post - theta_LTD)/volt, 0, 1e9), J_EE_min, J_EE_max)
+        g_EE = clip(g_EE - plasticity_on * (A2_minus * o1 + A3_minus * o1 * r2), J_EE_min, J_EE_max)
+        r1 += 1
+        r2 += 1
     '''
-    # LTP: use v_at_spike_post (voltage at spike time, stored before reset); post-reset v_post would be V_reset < theta_LTP so LTP would be 0
     ee_on_post = '''
-        g_EE = clip(g_EE + plasticity_on * A_LTP * clip((v_at_spike_post - theta_LTP)/volt, 0, 1e9) * clip((u_bar_post - theta_LTD)/volt, 0, 1e9) * x, J_EE_min, J_EE_max)
+        g_EE = clip(g_EE + plasticity_on * (A2_plus * r1 + A3_plus * r1 * o2), J_EE_min, J_EE_max)
+        o1 += 1
+        o2 += 1
     '''
 
     Syn_EE = Synapses(
@@ -177,11 +181,14 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
         on_pre=ee_on_pre,
         on_post=ee_on_post,
         namespace={
+            'tau_plus': tau_plus,
+            'tau_minus': tau_minus,
             'tau_x': tau_x,
-            'theta_LTD': theta_LTD,
-            'theta_LTP': theta_LTP,
-            'A_LTD': A_LTD,
-            'A_LTP': A_LTP,
+            'tau_y_triplet': tau_y_triplet,
+            'A2_minus': A2_minus,
+            'A3_minus': A3_minus,
+            'A2_plus': A2_plus,
+            'A3_plus': A3_plus,
             'J_EE_min': J_EE_min,
             'J_EE_max': J_EE_max,
         },
@@ -189,13 +196,18 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     Syn_EE.connect(i=i_ee, j=j_ee)
     Syn_EE.delay = (delay_min + rng.random(n_ee) * (delay_max - delay_min)) * second
     Syn_EE.g_EE = p['g_EE_init']
-    Syn_EE.x = 0
+    Syn_EE.r1 = 0
+    Syn_EE.r2 = 0
+    Syn_EE.o1 = 0
+    Syn_EE.o2 = 0
     Syn_EE.plasticity_on = 1 if plasticity_enabled else 0
 
     if not plasticity_enabled:
         # Disable STDP by setting amplitudes to 0
-        Syn_EE.namespace['A_LTD'] = 0
-        Syn_EE.namespace['A_LTP'] = 0
+        Syn_EE.namespace['A2_minus'] = 0 * nS
+        Syn_EE.namespace['A3_minus'] = 0 * nS
+        Syn_EE.namespace['A2_plus'] = 0 * nS
+        Syn_EE.namespace['A3_plus'] = 0 * nS
 
     # Initial EE weights (for row-sum normalization in run_simulation).
     # Use constant initial value so we don't read from device (fails in cpp_standalone before run).
@@ -249,10 +261,22 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     Syn_II.delay = (delay_min + rng.random(n_ii) * (delay_max - delay_min)) * second
     Syn_II.g_II = p['g_II_init']
 
-    # ----- Stimulus patterns: each pattern = random subset of E neurons (prob 0.05) -----
+    # ----- Stimulus patterns -----
     n_patterns = p['n_patterns']
     pattern_prob = p['pattern_prob']
-    patterns = (rng.random((n_patterns, N_E)) < pattern_prob)  # n_patterns x N_E, boolean
+    allow_pattern_overlap = p.get('allow_pattern_overlap', True)
+    if allow_pattern_overlap:
+        # Original behavior: independent Bernoulli membership for each pattern.
+        patterns = (rng.random((n_patterns, N_E)) < pattern_prob)  # n_patterns x N_E, boolean
+    else:
+        # No-overlap mode: each neuron belongs to at most one pattern.
+        patterns = np.zeros((n_patterns, N_E), dtype=bool)
+        p_any = min(1.0, n_patterns * pattern_prob)
+        assigned = rng.random(N_E) < p_any
+        assigned_idx = np.where(assigned)[0]
+        if assigned_idx.size > 0:
+            target_pattern = rng.integers(0, n_patterns, size=assigned_idx.size)
+            patterns[target_pattern, assigned_idx] = True
 
     # ----- Poisson drive: current-based with decay -----
     I_kick_E = p.get('I_kick_E', 0.05 * nA)

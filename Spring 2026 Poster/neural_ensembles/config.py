@@ -63,18 +63,20 @@ def get_params():
         'g_EI_init': 48.7 * nS,
 
         # -------------------------------------------------------------------------
-        # Excitatory STDP (Clopath) [Table 3]. A_LTP increased so LTP dominates
-        # during co-activity (LTP term has small voltage factors ~0.01 each).
+        # Excitatory STDP bounds [Table 3]
         # -------------------------------------------------------------------------
         'J_EE_min': 1.78 * nS,
         'J_EE_max': 21.4 * nS,
-        'tau_u': 10 * ms,
-        'tau_u_bar': 7 * ms,
-        'tau_x': 15 * ms,
-        'theta_LTD': -70 * mV,
-        'theta_LTP': -49 * mV,
-        'A_LTD': 0.0000 * nS,
-        'A_LTP': 0.012 * nS,
+        # Triplet STDP parameters (Pfister-Gerstner style)
+        'triplet_tau_plus': 16.8 * ms,
+        'triplet_tau_minus': 33.7 * ms,
+        'triplet_tau_x': 101 * ms,
+        'triplet_tau_y': 125 * ms,
+        # Keep pair terms weak and triplet LTP moderate so within-assembly weights can grow.
+        'triplet_A2_minus': 0.0008 * nS,
+        'triplet_A3_minus': 0.0 * nS,
+        'triplet_A2_plus': 0.0010 * nS,
+        'triplet_A3_plus': 0.0030 * nS,
 
         # -------------------------------------------------------------------------
         # Homeostatic normalization: every 20 ms, row sum of J_EE constant
@@ -107,6 +109,8 @@ def get_params():
         # -------------------------------------------------------------------------
         'n_patterns': 20,
         'pattern_prob': 0.05,
+        # If False, each excitatory neuron belongs to at most one pattern.
+        'allow_pattern_overlap': False,
         'pattern_duration': 1 * second,
         'inter_pattern_gap': 3 * second,
         'n_block_repeats': 20,
