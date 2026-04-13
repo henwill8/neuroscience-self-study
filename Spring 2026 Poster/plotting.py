@@ -468,6 +468,46 @@ class SimpleResults:
         n_times = self.stateMonExcV.shape[1]
         self.stateMonT = np.arange(n_times, dtype=float) * self.stateDT
 
+    def plot_assembly_w_in_w_out(self, ax_w_in, ax_w_out):
+        """
+        Time series of mean EE weight within CS/US assemblies (W_in) and mean weight from assembly
+        to non-members (W_out: pre in assembly, post outside).
+        Expects params W_in_t, W_in_per_assembly_vals, W_out_per_assembly_vals from Network.run().
+        """
+        p = self.p
+        if 'W_in_t' not in p or p['W_in_t'] is None or len(p['W_in_t']) == 0:
+            ax_w_in.text(0.5, 0.5, 'No W_in/W_out stats in params', ha='center', va='center', transform=ax_w_in.transAxes)
+            ax_w_out.set_visible(False)
+            return
+        t = np.asarray(p['W_in_t'], dtype=float)
+        win = np.asarray(p['W_in_per_assembly_vals'], dtype=float)
+        wout = np.asarray(p['W_out_per_assembly_vals'], dtype=float)
+        if win.ndim == 1:
+            win = win.reshape(-1, 1)
+        if wout.ndim == 1:
+            wout = wout.reshape(-1, 1)
+        labels = p.get('W_in_assembly_labels', None)
+        if labels is None:
+            labels = [f'Assembly {k}' for k in range(win.shape[1])]
+        else:
+            labels = list(labels)
+        colors = ['C3', 'C0', 'C2', 'C4']
+        for k in range(win.shape[1]):
+            c = colors[k % len(colors)]
+            lab = labels[k] if k < len(labels) else str(k)
+            ax_w_in.plot(t, win[:, k] * 1e12, color=c, label=lab, lw=1.2)
+            ax_w_out.plot(t, wout[:, k] * 1e12, color=c, label=lab, lw=1.2)
+        ax_w_in.set_ylabel(r'$W_{\mathrm{in}}$ (pA)')
+        ax_w_in.set_xlabel('Time (s)')
+        ax_w_in.set_title('Mean within-assembly EE weight')
+        ax_w_in.legend(loc='best', fontsize=8)
+        ax_w_in.set_xlim(0, self.duration)
+        ax_w_out.set_ylabel(r'$W_{\mathrm{out}}$ (pA)')
+        ax_w_out.set_xlabel('Time (s)')
+        ax_w_out.set_title(r'Mean EE $W_{\mathrm{out}}$: pre in assembly, post outside')
+        ax_w_out.legend(loc='best', fontsize=8)
+        ax_w_out.set_xlim(0, self.duration)
+
     def plot_spike_raster(self, ax):
         nExc = self.p['nExc']
         nInh = self.p['nInh']
@@ -965,7 +1005,8 @@ class SimpleResults:
 def plot_all_figures(results, show=True):
     """
     Create the standard poster figures from a SimpleResults instance.
-    Returns (fig1, fig2, fig3, fig4, fig5). If show is True, calls plt.show() at the end.
+    Returns (fig1, fig2, fig3, fig4, fig5, fig_w). fig_w is None if W_in/W_out was not recorded.
+    If show is True, calls plt.show() at the end.
     fig5: NS population trial trajectories (per-trial PCA trajectory overlay).
     """
     # Figure 1: raster, firing rate, voltage
@@ -994,6 +1035,15 @@ def plot_all_figures(results, show=True):
     if fig3 is not None:
         fig3.tight_layout()
 
+    # Assembly W_in / W_out vs time (EE plasticity)
+    fig_w = None
+    if 'W_in_t' in results.p and results.p['W_in_t'] is not None and len(results.p['W_in_t']) > 0:
+        fig_w = plt.figure(figsize=(8, 6))
+        ax_win = fig_w.add_subplot(2, 1, 1)
+        ax_wout = fig_w.add_subplot(2, 1, 2)
+        results.plot_assembly_w_in_w_out(ax_win, ax_wout)
+        fig_w.tight_layout()
+
     # Figure 4: PCA centroid trajectories
     fig4 = results.plot_pca_centroid_trajectories(bin_size=10*ms, n_components=3)
     if fig4 is not None:
@@ -1006,5 +1056,5 @@ def plot_all_figures(results, show=True):
 
     if show:
         plt.show()
-    return fig1, fig2, fig3, fig4, fig5
+    return fig1, fig2, fig3, fig4, fig5, fig_w
 

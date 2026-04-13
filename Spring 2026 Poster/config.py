@@ -29,19 +29,22 @@ def get_default_params():
         # -------------------------------------------------------------------------
         # CS-US training (red = CS, blue = US; paper: 440 ms red @ 25 Hz, 80 ms blue @ 50 Hz)
         # -------------------------------------------------------------------------
-        'nTrials': 30,
+        'nTrials': 50,
         'ISI': 360 * ms,              # time from CS onset to US onset (inter-stimulus interval)
         'propCS': 0.05,               # fraction of excitatory neurons selected for CS (red)
         'propUS': 0.05,               # fraction of excitatory neurons selected for US (blue)
         'interTrialInterval': 1 * second,
         'include_CS_only_trial': True,   # if True, add one extra trial with CS only (no US)
-        'cs_only_every_n_trials': 10,    # if int (e.g. 5), every nth trial is CS only (no US) to probe training
+        'cs_only_every_n_trials': None,    # if int (e.g. 5), every nth trial is CS only (no US) to probe training
         'CS_train_duration': 440 * ms,
         'CS_Hz': 25 * Hz,
         'US_train_duration': 80 * ms,
         'US_Hz': 50 * Hz,
 
         'spikeInputAmplitude': 0.98,  # current (nA) per CS/US pulse
+        # Small jitter breaks exact simultaneity across CS/US neurons so pair eSTDP sees
+        # stable pre/post order within a timestep (otherwise LTD often wins for sync drive).
+        'drive_spike_jitter': 0.1 * ms,
 
         # -------------------------------------------------------------------------
         # Network size and connectivity
@@ -87,33 +90,36 @@ def get_default_params():
         'weightCV': 0.1,   # 10% std relative to mean
 
         # -------------------------------------------------------------------------
-        # STDP (only EE when use_stdp is True). Per-block toggles: CS, US, NS (non-stimulated).
-        # stdp_blocks: None = all True; else dict e.g. {'CS_NS': True, 'US_CS': False}.
-        # Keys: CS_CS, CS_US, CS_NS, US_CS, US_US, US_NS, NS_CS, NS_US, NS_NS.
-        # Default: STDP only on connections where CS is presynaptic (CS_CS, CS_US, CS_NS).
+        # Pair-based additive eSTDP on EE (Hebbian, time-lag via exponential kernels).
+        # r_stdp on E decays with tau_+ (pre trace); s_stdp decays with tau_- (post trace).
+        # On post:  ΔjEE = +A_plus * r_stdp_pre   (pre-before-post, causal)
+        # On pre:    ΔjEE = -A_minus * s_stdp_post (post-before-pre, anti-causal)
+        # Amplitudes O(pA), same scale as jEE (~250 pA). stdp_blocks: per CS/US/NS pair toggles.
+        # If tau_- >> tau_+, s_stdp stays high longer → presynaptic spikes see more LTD (often
+        # depression-dominated under correlated drive). Defaults favor comparable / slightly
+        # shorter tau_- than classical Bi&Poo-style long LTD tail.
         # -------------------------------------------------------------------------
         'use_stdp': True,
         'stdp_blocks': None,
-        'tau_stdp_pre': 20 * ms,
-        'tau_stdp_post': 20 * ms,
-        'A_plus_stdp': 5 * pA,   # LTP when pre before post
-        'A_minus_stdp': 5 * pA,  # LTD when post before pre
+        'e_stdp_tau_plus': 20 * ms,
+        'e_stdp_tau_minus': 20 * ms,
+        'e_stdp_A_plus': 5 * pA,
+        'e_stdp_A_minus': 5 * pA,
         'w_min_EE': 0 * pA,
         'w_max_EE': 500 * pA,
 
         # -------------------------------------------------------------------------
-        # Inhibitory STDP (iSTDP) for I->E synapses
+        # Inhibitory STDP (iSTDP) for I->E synapses (sim.jl-style traces yE, yI)
         # -------------------------------------------------------------------------
-        'use_istdp': False,
-        'tau_y': 20 * ms,       # time constant of low-pass spike trace
-        'r0': 3 * Hz,           # target firing rate of excitatory neuron
-        'Z': 1 * pA,            # learning rate scaling
+        'use_istdp': True,
+        'istdp_tau_y': 20 * ms,
+        'r0': 3 * Hz,
+        'Z': 1 * pA,
         'J_EI_min': 0 * pA,
         'J_EI_max': 500 * pA,
 
         # -------------------------------------------------------------------------
-        # Homeostatic normalization of EE weights (keeps total input strength per
-        # neuron constant for synaptic competition). Set use_homeostatic_norm=False to disable.
+        # Homeostatic normalization of EE weights (row-sum toward initial totals).
         # -------------------------------------------------------------------------
         'use_homeostatic_norm': True,
         'homeostatic_norm_period': 20 * ms,
@@ -127,6 +133,12 @@ def get_default_params():
         'tauFallInh': 1 * ms,
         'delayExc': 1 * ms,
         'delayInh': 0.5 * ms,
+
+        # -------------------------------------------------------------------------
+        # EE assembly weight stats: W_in within assembly; W_out = pre in assembly, post outside
+        # -------------------------------------------------------------------------
+        'record_ee_w_stats': True,
+        'w_stats_record_dt': 0.2 * second,
 
         # -------------------------------------------------------------------------
         # Analysis options
