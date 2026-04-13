@@ -78,7 +78,7 @@ def plot_fig2b(results_path=None, n_assemblies_show=3, save=True):
     ax_top.legend(loc='upper right', fontsize=7, ncol=2)
     ax_top.set_xlim(left=0)
 
-    # W_out per assembly: one line per assembly (between that assembly and others)
+    # W_out per assembly: mean EE weight between assembly k and other assemblies (paper definition)
     W_out_per_assembly = res.get('W_out_per_assembly_vals')
     if W_out_per_assembly is None or len(W_out_per_assembly) == 0:
         raise ValueError('Result must contain W_out_per_assembly_vals')

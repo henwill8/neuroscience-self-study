@@ -1,6 +1,7 @@
 """
 Build the Litwin-Kumar & Doiron style network: AdEx E, LIF I, conductance synapses,
-triplet STDP (EE), row-sum normalization, iSTDP (EI), and Poisson drive.
+voltage-based EE STDP as in litwin-kumar_doiron_formation_2014/sim.jl (LTD on pre spike;
+LTP on postsynaptic spike, event-driven in Brian2), row-sum normalization, iSTDP (EI), Poisson drive.
 """
 from brian2 import *
 import numpy as np
@@ -18,11 +19,13 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     delay_min = float(p.get('delay_min', 0*ms) / second)
     delay_max = float(p.get('delay_max', 1.5*ms) / second)
 
-    # ----- Excitatory: AdEx with adaptive threshold (V_T + A_T, tau_T) -----
+    # ----- Excitatory: AdEx with adaptive threshold (V_T + A_T, tau_T) + u, u_bar for vSTDP -----
     adex_eqs = '''
         dv/dt = (g_L_E*(E_L_E - v) + g_L_E*Delta_T*exp((v - V_T_E)/Delta_T) - w + I_syn + I_ext) / C_E : volt
         dw/dt = (a_w*(v - E_L_E) - w) / tau_w : amp
         dV_thresh/dt = (V_T_E - V_thresh) / tau_T : volt
+        du/dt = (v - u) / tau_u : volt
+        du_bar/dt = (v - u_bar) / tau_u_bar : volt
         dyE/dt = -yE / tau_y : 1
         dI_ext/dt = -I_ext / tau_ext : amp
         I_syn = g_E*(E_E - v) + g_I*(E_I - v) : amp
@@ -60,6 +63,8 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
             'tau_d_E': p['tau_d_E'],
             'tau_r_I': p['tau_r_I'],
             'tau_d_I': p['tau_d_I'],
+            'tau_u': p['tau_u'],
+            'tau_u_bar': p['tau_u_bar'],
             'tau_y': p['tau_y'],
             'tau_ext': p.get('tau_ext', 2 * ms),
         },
@@ -67,6 +72,8 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     E_group.v = p['E_L_E']
     E_group.w = 0 * amp
     E_group.V_thresh = p['V_T_E']
+    E_group.u = p['E_L_E']
+    E_group.u_bar = p['E_L_E']
     E_group.yE = 0.0
     E_group.g_E = 0 * nS
     E_group.h_E = 0 * nS
@@ -139,56 +146,42 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     no_aut_ii = i_ii != j_ii
     i_ii, j_ii = i_ii[no_aut_ii], j_ii[no_aut_ii]
 
-    # ----- EE synapses: conductance + triplet STDP (Pfister-Gerstner style) -----
-    # Traces:
-    # r1/r2: pre traces (fast/slow), o1/o2: post traces (fast/slow)
-    # on_pre: LTD
-    # on_post: LTP
-    tau_plus = p['triplet_tau_plus']
-    tau_minus = p['triplet_tau_minus']
-    tau_x = p['triplet_tau_x']
-    tau_y_triplet = p['triplet_tau_y']
-    A2_minus = p['triplet_A2_minus']
-    A3_minus = p['triplet_A3_minus']
-    A2_plus = p['triplet_A2_plus']
-    A3_plus = p['triplet_A3_plus']
+    # ----- EE synapses: conductance + voltage-based STDP (sim.jl) -----
+    # LTD on pre spike (u_post). LTP: reference integrator applies voltage-dependent LTP each dt;
+    # here we use postsynaptic spikes (event-driven) so updates stay in compiled Brian2 code.
+    # Presynaptic trace x: dx/dt = -x/tau_x; on pre spike x += ms/tau_x (sim.jl: x += 1/taux).
+    theta_LTD = p['theta_LTD']
+    theta_LTP = p['theta_LTP']
+    A_LTD = p['A_LTD']
+    A_LTP = p['A_LTP']
+    tau_x = p['tau_x']
     J_EE_min = p['J_EE_min']
     J_EE_max = p['J_EE_max']
 
     ee_model = '''
         g_EE : siemens
-        dr1/dt = -r1 / tau_plus : 1 (event-driven)
-        dr2/dt = -r2 / tau_x : 1 (event-driven)
-        do1/dt = -o1 / tau_minus : 1 (event-driven)
-        do2/dt = -o2 / tau_y_triplet : 1 (event-driven)
+        dx/dt = -x / tau_x : 1 (event-driven)
         plasticity_on : 1 (constant)
     '''
     ee_on_pre = '''
         h_E_post += g_EE
-        g_EE = clip(g_EE - plasticity_on * (A2_minus * o1 + A3_minus * o1 * r2), J_EE_min, J_EE_max)
-        r1 += 1
-        r2 += 1
+        g_EE = clip(g_EE - plasticity_on * A_LTD * clip((u_post - theta_LTD) / mV, 0, 1e9), J_EE_min, J_EE_max)
+        x += ms / tau_x
     '''
     ee_on_post = '''
-        g_EE = clip(g_EE + plasticity_on * (A2_plus * r1 + A3_plus * r1 * o2), J_EE_min, J_EE_max)
-        o1 += 1
-        o2 += 1
+        g_EE = clip(g_EE + plasticity_on * A_LTP * (dt / second) * x * clip((v_post - theta_LTP) / mV, 0, 1e9) * clip((u_bar_post - theta_LTD) / mV, 0, 1e9), J_EE_min, J_EE_max)
     '''
-
     Syn_EE = Synapses(
         E_group, E_group,
         model=ee_model,
         on_pre=ee_on_pre,
         on_post=ee_on_post,
         namespace={
-            'tau_plus': tau_plus,
-            'tau_minus': tau_minus,
             'tau_x': tau_x,
-            'tau_y_triplet': tau_y_triplet,
-            'A2_minus': A2_minus,
-            'A3_minus': A3_minus,
-            'A2_plus': A2_plus,
-            'A3_plus': A3_plus,
+            'theta_LTD': theta_LTD,
+            'theta_LTP': theta_LTP,
+            'A_LTD': A_LTD,
+            'A_LTP': A_LTP,
             'J_EE_min': J_EE_min,
             'J_EE_max': J_EE_max,
         },
@@ -196,18 +189,12 @@ def build_network(params, rng, plasticity_enabled=True, use_istdp=True):
     Syn_EE.connect(i=i_ee, j=j_ee)
     Syn_EE.delay = (delay_min + rng.random(n_ee) * (delay_max - delay_min)) * second
     Syn_EE.g_EE = p['g_EE_init']
-    Syn_EE.r1 = 0
-    Syn_EE.r2 = 0
-    Syn_EE.o1 = 0
-    Syn_EE.o2 = 0
+    Syn_EE.x = 0
     Syn_EE.plasticity_on = 1 if plasticity_enabled else 0
 
     if not plasticity_enabled:
-        # Disable STDP by setting amplitudes to 0
-        Syn_EE.namespace['A2_minus'] = 0 * nS
-        Syn_EE.namespace['A3_minus'] = 0 * nS
-        Syn_EE.namespace['A2_plus'] = 0 * nS
-        Syn_EE.namespace['A3_plus'] = 0 * nS
+        Syn_EE.namespace['A_LTD'] = 0 * nS
+        Syn_EE.namespace['A_LTP'] = 0 * nS
 
     # Initial EE weights (for row-sum normalization in run_simulation).
     # Use constant initial value so we don't read from device (fails in cpp_standalone before run).

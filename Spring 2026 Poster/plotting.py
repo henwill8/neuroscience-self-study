@@ -11,6 +11,85 @@ from mpl_toolkits.mplot3d import Axes3D
 BLACK_YELLOW_CMAP = LinearSegmentedColormap.from_list('black_yellow', ['black', 'yellow'], N=256)
 
 
+def draw_cs_us_stimulus_spans(ax, p, zorder=0, legend_label=True):
+    """
+    Shade CS/US intervals from params cs_stim_intervals_s, us_stim_intervals_s (each row [t0, t1] s).
+    Sustained mode: short windows per nominal pulse; pulse_train mode: full epoch per trial.
+    Trial-level envelopes (if needed): cs_stim_epoch_intervals_s, us_stim_epoch_intervals_s.
+    """
+    labeled_cs = False
+    labeled_us = False
+    intervals_cs = p.get('cs_stim_intervals_s')
+    intervals_us = p.get('us_stim_intervals_s')
+    if intervals_cs is not None:
+        arr = np.asarray(intervals_cs, dtype=float)
+        if arr.ndim == 1 and arr.size >= 2:
+            arr = arr.reshape(1, -1)
+        for row in arr:
+            if row.size < 2:
+                continue
+            t0, t1 = float(row[0]), float(row[1])
+            if t1 < t0:
+                t0, t1 = t1, t0
+            show = legend_label and not labeled_cs
+            ax.axvspan(
+                t0, t1, facecolor='#3355aa', alpha=0.18, zorder=zorder, linewidth=0,
+                label='CS stim' if show else None,
+            )
+            if show:
+                labeled_cs = True
+    if intervals_us is not None:
+        arr = np.asarray(intervals_us, dtype=float)
+        if arr.ndim == 1 and arr.size >= 2:
+            arr = arr.reshape(1, -1)
+        for row in arr:
+            if row.size < 2:
+                continue
+            t0, t1 = float(row[0]), float(row[1])
+            if t1 < t0:
+                t0, t1 = t1, t0
+            show = legend_label and not labeled_us
+            ax.axvspan(
+                t0, t1, facecolor='#aa5522', alpha=0.18, zorder=zorder, linewidth=0,
+                label='US stim' if show else None,
+            )
+            if show:
+                labeled_us = True
+
+
+def draw_cs_us_stimulus_pulse_lines(ax, p, zorder=2, legend_label=True):
+    """
+    Vertical line at each external CS/US input spike time (params cs_stim_pulse_times_s,
+    us_stim_pulse_times_s from Network._build_cs_us_input).
+    """
+    labeled_cs = False
+    labeled_us = False
+    t_cs = p.get('cs_stim_pulse_times_s')
+    t_us = p.get('us_stim_pulse_times_s')
+    if t_cs is not None and np.asarray(t_cs).size > 0:
+        for tp in np.unique(np.asarray(t_cs, dtype=float)):
+            if not np.isfinite(tp):
+                continue
+            show = legend_label and not labeled_cs
+            ax.axvline(
+                float(tp), color='#1a3a7a', ls='-', lw=0.75, alpha=0.65, zorder=zorder,
+                label='CS pulse' if show else None,
+            )
+            if show:
+                labeled_cs = True
+    if t_us is not None and np.asarray(t_us).size > 0:
+        for tp in np.unique(np.asarray(t_us, dtype=float)):
+            if not np.isfinite(tp):
+                continue
+            show = legend_label and not labeled_us
+            ax.axvline(
+                float(tp), color='#7a3010', ls='-', lw=0.75, alpha=0.65, zorder=zorder,
+                label='US pulse' if show else None,
+            )
+            if show:
+                labeled_us = True
+
+
 def _hmm_viterbi_poisson(counts, trans_mat, lambda_down, lambda_up):
     """
     Two-state (DOWN=0, UP=1) HMM with Poisson emissions. Viterbi decoding.
@@ -276,74 +355,34 @@ def compute_trial_binned_data(results, bin_size=5*ms, use_exc_only=True):
     return data, conditions
 
 
-def compute_ns_peak_firing_stats(results, bin_size=5*ms):
+def compute_mean_firing_rates(results):
     """
-    For the non-stimulated (NS) excitatory neuron group (neurons that are neither CS nor US),
-    compute the peak average firing time within each trial and its statistics across trials.
-
-    For each trial: average firing rate across NS neurons in each time bin; the time (within trial)
-    at which this average is maximum is the "peak time" for that trial.
-    Returns mean and variance of these peak times across trials.
-
-    Requires params: trial_starts_s, trial_duration_s, cs_neuron_inds, us_neuron_inds.
+    Population-mean firing rates (Hz) for excitatory and inhibitory units over the full run:
+    total_spikes / (n_neurons * duration).
 
     Returns
     -------
-    dict with keys:
-        mean_peak_time_s : float
-            Mean time (s within trial) of peak NS firing across trials.
-        variance_peak_time_s : float
-            Variance of peak time across trials (s^2).
-        peak_times_per_trial_s : ndarray, shape (n_trials,)
-            Peak time (s within trial) for each trial; np.nan if no valid peak.
-        n_ns_neurons : int
-            Number of NS (non-stimulated) excitatory neurons.
-    or None if trial info or CS/US indices are missing.
+    dict with keys mean_rate_E_Hz, mean_rate_I_Hz, duration_s, n_spikes_E, n_spikes_I, nExc, nInh,
+    or None if duration is non-positive or population sizes missing.
     """
     p = results.p
-    if 'trial_starts_s' not in p or 'trial_duration_s' not in p:
+    T = float(p['duration'] / second)
+    if T <= 0:
         return None
-    if 'cs_neuron_inds' not in p or 'us_neuron_inds' not in p:
+    n_e = int(p['nExc'])
+    n_i = int(p['nInh'])
+    if n_e < 1 or n_i < 1:
         return None
-    cs_set = set(np.atleast_1d(p['cs_neuron_inds']))
-    us_set = set(np.atleast_1d(p['us_neuron_inds']))
-    n_exc = p['nExc']
-    ns_inds = np.array([i for i in range(n_exc) if i not in cs_set and i not in us_set])
-    if len(ns_inds) == 0:
-        return {
-            'mean_peak_time_s': np.nan,
-            'variance_peak_time_s': np.nan,
-            'peak_times_per_trial_s': np.array([]),
-            'n_ns_neurons': 0,
-        }
-
-    data, _ = compute_trial_binned_data(results, bin_size=bin_size, use_exc_only=True)
-    if data is None or data.size == 0:
-        return None
-    # data: (n_trials, n_timepoints, n_neurons); restrict to NS neurons
-    ns_data = data[:, :, ns_inds]  # (n_trials, n_timepoints, n_ns)
-    # Average across NS neurons: (n_trials, n_timepoints)
-    mean_fr_per_trial = np.mean(ns_data, axis=2)
-    bin_size_s = float(bin_size / second)
-    n_timepoints = mean_fr_per_trial.shape[1]
-    # Center of each bin within trial (s)
-    time_within_trial = (np.arange(n_timepoints) + 0.5) * bin_size_s
-
-    peak_bin_per_trial = np.nanargmax(mean_fr_per_trial, axis=1)
-    peak_times_per_trial_s = time_within_trial[peak_bin_per_trial]
-    valid = np.isfinite(peak_times_per_trial_s)
-    if np.any(valid):
-        mean_peak_time_s = float(np.mean(peak_times_per_trial_s))
-        variance_peak_time_s = float(np.var(peak_times_per_trial_s))
-    else:
-        mean_peak_time_s = np.nan
-        variance_peak_time_s = np.nan
-
+    n_spike_e = int(len(results.spikeMonExcT))
+    n_spike_i = int(len(results.spikeMonInhT))
     return {
-        'mean_peak_time_s': mean_peak_time_s,
-        'variance_peak_time_s': variance_peak_time_s,
-        'peak_times_per_trial_s': peak_times_per_trial_s,
-        'n_ns_neurons': len(ns_inds),
+        'mean_rate_E_Hz': n_spike_e / (n_e * T),
+        'mean_rate_I_Hz': n_spike_i / (n_i * T),
+        'duration_s': T,
+        'n_spikes_E': n_spike_e,
+        'n_spikes_I': n_spike_i,
+        'nExc': n_e,
+        'nInh': n_i,
     }
 
 
@@ -467,10 +506,16 @@ class SimpleResults:
         # Time axis: match length to recorded voltage (StateMonitor is neurons x time)
         n_times = self.stateMonExcV.shape[1]
         self.stateMonT = np.arange(n_times, dtype=float) * self.stateDT
+        # Optional: L&D-style W_in / W_out time series for CS, US, NS (from Network.run)
+        self.w_stats_t = np.asarray(params.get('w_stats_t', []), dtype=float)
+        self.w_in_CS_US_NS = np.asarray(params.get('w_in_CS_US_NS', np.zeros((0, 3))), dtype=float)
+        self.w_out_CS_US_NS = np.asarray(params.get('w_out_CS_US_NS', np.zeros((0, 3))), dtype=float)
 
     def plot_spike_raster(self, ax):
         nExc = self.p['nExc']
         nInh = self.p['nInh']
+        draw_cs_us_stimulus_spans(ax, self.p, zorder=0, legend_label=True)
+        draw_cs_us_stimulus_pulse_lines(ax, self.p, zorder=2, legend_label=True)
         if 'cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p:
             cs_set = set(self.p['cs_neuron_inds'])
             us_set = set(self.p['us_neuron_inds'])
@@ -483,7 +528,7 @@ class SimpleResults:
             t_exc = np.asarray(self.spikeMonExcT)
             i_exc = np.asarray(self.spikeMonExcI)
             y_exc = np.array([neuron_to_display[i] for i in i_exc])
-            ax.scatter(t_exc, y_exc, c='blue', s=1, marker='.', linewidths=0)
+            ax.scatter(t_exc, y_exc, c='blue', s=1, marker='.', linewidths=0, zorder=3)
             ax.axhline(nCS - 0.5, color='k', lw=0.5, linestyle='-')
             ax.axhline(nCS + nUS - 0.5, color='k', lw=0.5, linestyle='-')
             ax.scatter(self.spikeMonInhT, nExc + self.spikeMonInhI, s=1, c='red', marker='.', linewidths=0)
@@ -491,12 +536,17 @@ class SimpleResults:
             ax.set_ylim(-0.5, self.p['nUnits'] - 0.5)
             ax.set_ylabel("Neuron (CS | US | NS | inh)")
         else:
-            ax.scatter(self.spikeMonExcT, self.spikeMonExcI, s=1, c='cyan', marker='.')
+            t_exc = np.asarray(self.spikeMonExcT)
+            i_exc = np.asarray(self.spikeMonExcI)
+            ax.scatter(t_exc, i_exc, s=1, c='cyan', marker='.', zorder=3)
             ax.scatter(self.spikeMonInhT, nExc + self.spikeMonInhI, s=1, c='red', marker='.', linewidths=0)
             ax.set_ylim(-0.5, self.p['nUnits'] - 0.5)
             ax.set_ylabel("Neuron index")
         ax.set_xlim(0, self.duration)
         ax.set_xlabel("Time (s)")
+        h, _ = ax.get_legend_handles_labels()
+        if h:
+            ax.legend(loc='upper right', fontsize=7, framealpha=0.9)
 
     def plot_firing_rate(self, ax, bin_size=5*ms, show_upstate=True,
                          upstate_bin_size=10*ms, p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0):
@@ -505,6 +555,7 @@ class SimpleResults:
         centers = bins[:-1] + bin_size_s / 2
         nExc = self.p['nExc']
         nInh = self.p['nInh']
+        draw_cs_us_stimulus_spans(ax, self.p, zorder=0, legend_label=True)
         drew_upstate_span = False
         if show_upstate:
             _, upstate_mask = detect_upstates(self, bin_size=upstate_bin_size, use_exc_only=True,
@@ -561,9 +612,22 @@ class SimpleResults:
             ax.plot(centers, FRExc, color='cyan', alpha=0.6)
             ax.plot(centers, FRInh, color='red', alpha=0.6)
 
+        draw_cs_us_stimulus_pulse_lines(ax, self.p, zorder=3, legend_label=True)
+
         ax.set_ylabel("Firing rate (Hz)")
         ax.set_xlabel("Time (s)")
-        if (show_upstate and drew_upstate_span) or ('cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p):
+        has_stim_spans = False
+        for key in (
+            'cs_stim_intervals_s', 'us_stim_intervals_s',
+            'cs_stim_pulse_times_s', 'us_stim_pulse_times_s',
+        ):
+            v = self.p.get(key)
+            if v is not None and np.asarray(v).size > 0:
+                has_stim_spans = True
+                break
+        if (show_upstate and drew_upstate_span) or (
+            'cs_neuron_inds' in self.p and 'us_neuron_inds' in self.p
+        ) or has_stim_spans:
             ax.legend(loc='upper right', fontsize=7)
 
     def plot_voltage(self, ax, unitType='Exc', neuron_index=0, mean=False,
@@ -602,6 +666,10 @@ class SimpleResults:
 
     def plot_voltage_by_groups(self, ax=None, use_sem=True):
         """Plot mean voltage ± error (SEM or SD) for each group (CS, US, NS, inh) on one axes."""
+        if ax is None:
+            _, ax = plt.subplots(figsize=(10, 4))
+        draw_cs_us_stimulus_spans(ax, self.p, zorder=0, legend_label=False)
+        draw_cs_us_stimulus_pulse_lines(ax, self.p, zorder=1, legend_label=False)
         V_exc = np.asarray(self.stateMonExcV)
         V_inh = np.asarray(self.stateMonInhV)
         t = self.stateMonT
@@ -818,21 +886,16 @@ class SimpleResults:
             created_fig.tight_layout()
         return created_fig
 
-    def get_ns_peak_firing_stats(self, bin_size=5*ms):
+    def get_mean_firing_rates(self):
         """
-        Optionally measure peak average firing time and its variance for the non-stimulated (NS)
-        excitatory neuron group across trials.
-
-        For each trial, the time (within trial) at which the trial-averaged NS firing rate is
-        maximum is recorded; returns the mean and variance of those peak times across trials.
+        Population-mean firing rates (Hz) for E and I over params['duration'].
 
         Returns
         -------
         dict or None
-            Keys: mean_peak_time_s, variance_peak_time_s, peak_times_per_trial_s, n_ns_neurons.
-            None if trial info or CS/US indices are missing.
+            Keys: mean_rate_E_Hz, mean_rate_I_Hz, duration_s, n_spikes_E, n_spikes_I, nExc, nInh.
         """
-        return compute_ns_peak_firing_stats(self, bin_size=bin_size)
+        return compute_mean_firing_rates(self)
 
     def plot_ns_trial_trajectories(self, bin_size=5*ms, n_components=3, ax_2d=None, ax_3d=None,
                                    color_by_time=True, cmap='viridis', alpha=0.75, linewidth=1.2):
@@ -918,6 +981,42 @@ class SimpleResults:
             fig_out.tight_layout()
         return fig_out
 
+    def plot_ee_w_in_w_out(self, figsize=(8, 6)):
+        """
+        W_in and W_out vs time for CS, US, NS excitatory populations (Litwin-Kumar & Doiron 2014 definitions).
+        Requires params populated by Network.run with record_ee_w_stats.
+        Returns a new figure or None if no samples were recorded.
+        """
+        if self.w_stats_t.size == 0 or self.w_in_CS_US_NS.size == 0:
+            return None
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+        t = self.w_stats_t
+        labels = ('CS', 'US', 'NS')
+        colors = ('C3', 'C0', 'C2')
+        win = self.w_in_CS_US_NS * 1e9  # siemens → nS
+        wout = self.w_out_CS_US_NS * 1e9
+        n_pop = min(3, win.shape[1])
+        for k in range(n_pop):
+            ax1.plot(
+                t, np.where(np.isfinite(win[:, k]), win[:, k], np.nan),
+                color=colors[k], lw=1.2, label=labels[k],
+            )
+            ax2.plot(
+                t, np.where(np.isfinite(wout[:, k]), wout[:, k], np.nan),
+                color=colors[k], lw=1.2, label=labels[k],
+            )
+        ax1.set_ylabel(r'$W_{\mathrm{in}}$ (nS)')
+        ax1.set_title(r'$W_{\mathrm{in}}$: mean EE weight within population')
+        ax1.legend(ncol=3, fontsize=8, loc='best')
+        ax1.grid(True, alpha=0.3)
+        ax2.set_ylabel(r'$W_{\mathrm{out}}$ (nS)')
+        ax2.set_xlabel('Time (s)')
+        ax2.set_title(r'$W_{\mathrm{out}}$: mean EE weight between populations')
+        ax2.legend(ncol=3, fontsize=8, loc='best')
+        ax2.grid(True, alpha=0.3)
+        fig.tight_layout()
+        return fig
+
     def plot_weight_change_blocks(self, ax=None):
         """
         Bar graph of mean ± SEM percentage weight change by block (CS→CS, CS→US, US→CS, US→US, etc.)
@@ -965,8 +1064,9 @@ class SimpleResults:
 def plot_all_figures(results, show=True):
     """
     Create the standard poster figures from a SimpleResults instance.
-    Returns (fig1, fig2, fig3, fig4, fig5). If show is True, calls plt.show() at the end.
+    Returns (fig1, fig2, fig3, fig4, fig5, fig6). If show is True, calls plt.show() at the end.
     fig5: NS population trial trajectories (per-trial PCA trajectory overlay).
+    fig6: W_in / W_out time series for CS, US, NS (None if not recorded).
     """
     # Figure 1: raster, firing rate, voltage
     fig1 = plt.figure(figsize=(8, 10))
@@ -1004,7 +1104,10 @@ def plot_all_figures(results, show=True):
     if fig5 is not None:
         fig5.tight_layout()
 
+    # Figure 6: L&D-style W_in / W_out for CS, US, NS
+    fig6 = results.plot_ee_w_in_w_out()
+
     if show:
         plt.show()
-    return fig1, fig2, fig3, fig4, fig5
+    return fig1, fig2, fig3, fig4, fig5, fig6
 

@@ -7,7 +7,7 @@ Run with:  python experiments.py [--list] [experiment_name ...]
           python experiments.py --list
 """
 import argparse
-from brian2 import seed, second
+from brian2 import seed, second, nS
 import numpy as np
 
 from config import get_default_params, derive_trial_params
@@ -36,12 +36,16 @@ def _run_network(params, rng, show_plots=True):
     results = SimpleResults(
         spikeMonExc, spikeMonInh, stateMonExc, stateMonInh, params
     )
-    if params.get('measure_ns_peak_firing', False):
-        stats = results.get_ns_peak_firing_stats()
-        if stats is not None:
-            results.p['ns_peak_firing_stats'] = stats
-            print(f"NS (non-stimulated) excitatory: mean peak time = {stats['mean_peak_time_s']:.4f} s, "
-                  f"variance = {stats['variance_peak_time_s']:.6f} s² (n_ns = {stats['n_ns_neurons']})")
+    if params.get('measure_mean_firing_rates', False):
+        fr = results.get_mean_firing_rates()
+        if fr is not None:
+            results.p['mean_firing_rates'] = fr
+            print(
+                f"Mean firing rate: E = {fr['mean_rate_E_Hz']:.3f} Hz "
+                f"({fr['n_spikes_E']} spikes / {fr['nExc']} neurons / {fr['duration_s']:.3f} s), "
+                f"I = {fr['mean_rate_I_Hz']:.3f} Hz "
+                f"({fr['n_spikes_I']} spikes / {fr['nInh']} neurons / {fr['duration_s']:.3f} s)"
+            )
     if show_plots:
         plot_all_figures(results, show=True)
     return params, results
@@ -128,40 +132,9 @@ def run_ns_perturb_trial0(show_plots=True):
     params = get_default_params()
     params['ns_perturbation_trial'] = 0
     params['ns_perturbation_t_s'] = 0.2  # seconds after trial 0 start
-    params['ns_perturbation_amplitude'] = 0.2  # nA; optional, defaults to spikeInputAmplitude
+    params['ns_perturbation_amplitude'] = 0.2 * nS  # optional; defaults to spikeInputAmplitude
     derive_trial_params(params)
     return _run_network(params, rng, show_plots=show_plots)
-
-
-@_register("upstate_kick", "Transient kick to random small % of E neurons to probe up-state initiation and structured spontaneity.")
-def run_upstate_kick(show_plots=True):
-    """
-    Spontaneous activity only: no CS/US trials. Deliver a brief external kick to a random 2%
-    of excitatory neurons at a fixed time (after a short baseline). Goal: see whether the kick
-    can initiate an up state and whether subsequent activity is structured or unstructured.
-    """
-    seed(43)
-    np.random.seed(43)
-    rng = np.random.default_rng(43)
-    params = get_default_params()
-    # No trials — spontaneous activity only, then one kick
-    params['nTrials'] = 0
-    params['include_CS_only_trial'] = False
-    derive_trial_params(params)
-    # Explicit duration (derive_trial_params would give invalid duration when nTrials=0)
-    params['duration'] = 5 * second  # ~2 s baseline, kick at 2 s, ~3 s to observe response
-    # Kick after ~2 s baseline
-    params['upstate_kick_t_s'] = 2.0
-    params['upstate_kick_fraction'] = 0.02   # 2% of E neurons
-    params['upstate_kick_amplitude'] = 0.5   # nA (strong enough to depolarize)
-    params['upstate_kick_n_pulses'] = 5      # short train at 50 Hz
-    params['upstate_kick_Hz'] = 50.0
-    params['save_checkpoint'] = False
-    params['load_checkpoint_path'] = 'results/istdp_network_checkpoint.pkl'
-    params, results = _run_network(params, rng, show_plots=show_plots)
-    if params.get('upstate_kick_n'):
-        print(f"Up-state kick: {params['upstate_kick_n']} neurons at t={params.get('upstate_kick_t_s', '?')} s")
-    return params, results
 
 
 # ---------------------------------------------------------------------------

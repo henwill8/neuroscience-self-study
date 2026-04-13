@@ -1,13 +1,13 @@
 # Neuronal Assemblies Simulation (Litwin-Kumar & Doiron style)
 
-Brian2 simulation for the formation of neuronal assemblies via voltage-based excitatory STDP (Clopath et al.), inhibitory STDP (iSTDP), and synaptic normalization.
+Brian2 simulation for the formation of neuronal assemblies, aligned with the authors’ reference integrator in `litwin-kumar_doiron_formation_2014/sim.jl`: voltage-based excitatory STDP (LTD on pre spike; **continuous** LTP each timestep, as in Julia), inhibitory STDP (iSTDP), and EE row-sum normalization.
 
 ## Network
 
 - **4,000** excitatory (AdEx) and **1,000** inhibitory (LIF) neurons
 - Random connectivity **p = 0.2**
 - Conductance-based synapses with double-exponential kinetics (τ_r, τ_d for E and I)
-- **EE**: Clopath voltage-based STDP (u, ū, x), bounds [J_EE_min, J_EE_max]
+- **EE**: same plasticity structure as `sim.jl` (u / ū filters, presynaptic trace `x` with spike increment `1/τ_x`), bounds [J_EE_min, J_EE_max]; initial EE weight **jee0 = 2.86** as in `weightpars()`
 - **EE row-sum normalization** every 20 ms
 - **EI**: iSTDP targeting 3 Hz postsynaptic rate
 

@@ -12,11 +12,51 @@ def load_results(path='results/assembly_simulation_results.pkl'):
         return pickle.load(f)
 
 
+def load_trained_model(path):
+    """
+    Load a checkpoint written by run_simulation.save_trained_model_npz (model_*.npz).
+
+    Returns a dict with 'params' (Brian2 quantities, via pickle) and numpy arrays for
+    connectivity, weights in nS, delays in seconds, patterns (bool), use_istdp, t_end_s.
+    Only load files you trust: params are unpickled from the archive.
+    """
+    with np.load(path, allow_pickle=False) as z:
+        ver = int(z['format_version'])
+        if ver != 1:
+            raise ValueError('Unsupported model format_version %r (expected 1)' % ver)
+        p = pickle.loads(z['params_pickle'].tobytes())
+        out = {
+            'params': p,
+            't_end_s': float(z['t_end_s']),
+            'use_istdp': bool(int(z['use_istdp'])),
+            'patterns': z['patterns'].astype(bool),
+            'i_ee': np.asarray(z['i_ee']),
+            'j_ee': np.asarray(z['j_ee']),
+            'g_EE': np.asarray(z['g_EE'], dtype=np.float64),
+            'g_EE_start': np.asarray(z['g_EE_start'], dtype=np.float64),
+            'x_ee': np.asarray(z['x_ee'], dtype=np.float64),
+            'delay_ee': np.asarray(z['delay_ee'], dtype=np.float64),
+            'i_ei': np.asarray(z['i_ei']),
+            'j_ei': np.asarray(z['j_ei']),
+            'g_EI': np.asarray(z['g_EI'], dtype=np.float64),
+            'delay_ei': np.asarray(z['delay_ei'], dtype=np.float64),
+            'i_ie': np.asarray(z['i_ie']),
+            'j_ie': np.asarray(z['j_ie']),
+            'g_IE': np.asarray(z['g_IE'], dtype=np.float64),
+            'delay_ie': np.asarray(z['delay_ie'], dtype=np.float64),
+            'i_ii': np.asarray(z['i_ii']),
+            'j_ii': np.asarray(z['j_ii']),
+            'g_II': np.asarray(z['g_II'], dtype=np.float64),
+            'delay_ii': np.asarray(z['delay_ii'], dtype=np.float64),
+        }
+    return out
+
+
 def compute_W_in_W_out(g_EE, i_ee, j_ee, patterns):
     """
     Given current g_EE (array), connectivity (i_ee, j_ee), and patterns (n_patterns x N_E),
     return (W_in_mean, W_out_mean) in same units as g_EE.
-    W_in is mean synaptic strength over synapses with both pre and post within the same assembly.
+    W_in / W_out per assembly (see compute_W_in_W_out_per_assembly).
     """
     W_in_per_assembly, W_out_per_assembly = compute_W_in_W_out_per_assembly(g_EE, i_ee, j_ee, patterns)
     valid_in = [w for w in W_in_per_assembly if not np.isnan(w)]
@@ -28,28 +68,33 @@ def compute_W_in_W_out(g_EE, i_ee, j_ee, patterns):
 
 def compute_W_in_W_out_per_assembly(g_EE, i_ee, j_ee, patterns):
     """
-    Return (W_in_per_assembly, W_out_per_assembly).
-    W_in_per_assembly: list of length n_patterns; element k is mean weight of synapses
-    where both pre and post are in assembly k (nan if assembly has < 2 neurons).
-    W_out_per_assembly: list of length n_patterns; element k is mean weight of synapses
-    that have exactly one endpoint in assembly k (between assembly k and others).
+    Return (W_in_per_assembly, W_out_per_assembly); same semantics as poster utils.compute_W_in_W_out_per_assembly.
     """
-    n_patterns = patterns.shape[0]
+    g_EE = np.asarray(g_EE, dtype=np.float64).ravel()
+    i_ee = np.asarray(i_ee, dtype=np.int64).ravel()
+    j_ee = np.asarray(j_ee, dtype=np.int64).ravel()
+    n_patterns, _ = patterns.shape
+
     W_in_per_assembly = []
     W_out_per_assembly = []
     for k in range(n_patterns):
-        in_k = np.where(patterns[k, :])[0]
-        in_set = set(in_k)
+        if not np.any(patterns[k, :]):
+            W_in_per_assembly.append(np.nan)
+            W_out_per_assembly.append(np.nan)
+            continue
         w_in_list = []
-        w_out_list = []  # synapses with exactly one endpoint in this assembly
+        w_out_list = []
         for idx in range(len(g_EE)):
-            pre, post = i_ee[idx], j_ee[idx]
-            w = float(g_EE[idx]) if hasattr(g_EE[idx], '__float__') else g_EE[idx]
-            pre_in = pre in in_set
-            post_in = post in in_set
-            if pre_in and post_in:
+            w = float(g_EE[idx])
+            if w <= 0.0:
+                continue
+            pre = int(i_ee[idx])
+            post = int(j_ee[idx])
+            pre_k = bool(patterns[k, pre])
+            post_k = bool(patterns[k, post])
+            if pre_k and post_k:
                 w_in_list.append(w)
-            elif pre_in or post_in:
+            elif pre_k and not post_k:
                 w_out_list.append(w)
         W_in_per_assembly.append(np.mean(w_in_list) if len(w_in_list) >= 2 else np.nan)
         W_out_per_assembly.append(np.mean(w_out_list) if w_out_list else np.nan)
@@ -58,7 +103,7 @@ def compute_W_in_W_out_per_assembly(g_EE, i_ee, j_ee, patterns):
 
 def assembly_weights(results):
     """
-    Compute average synaptic strength within assemblies (W_in) vs between (W_out).
+    Compute average synaptic strength within assemblies (W_in) vs between different assemblies (W_out).
     """
     g_EE = np.asarray(results['g_EE'])
     if hasattr(g_EE[0], 'item'):

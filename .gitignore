@@ -1,3 +1,10 @@
 *.code-workspace
 /Spring 2026 Poster/__pycache__
 /Spring 2026 Poster/neural_ensembles/__pycache__
+*.h5
+*.npz
+*.pkl
+*.pkl
+/Spring 2026 Poster/results
+Spring 2026 Poster/neural_ensembles/results/assembly_with_istdp.pkl
+Spring 2026 Poster/results/istdp_network_checkpoint.pkl

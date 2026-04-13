@@ -15,6 +15,56 @@ from config import get_params
 from network import build_network
 from analysis import compute_W_in_W_out, compute_W_in_W_out_per_assembly
 
+# Trained-network checkpoint (weights, delays, connectivity, params) for reload without spike history.
+_MODEL_NPZ_VERSION = np.int32(1)
+
+
+def save_trained_model_npz(
+    filepath,
+    params_dict,
+    Syn_EE,
+    Syn_EI,
+    Syn_IE,
+    Syn_II,
+    g_EE_start_arr,
+    patterns_arr,
+    use_istdp,
+    t_end_s,
+):
+    """
+    Write a compressed .npz with all plastic/fixed synaptic weights (nS), delays (s),
+    connectivity indices, EE presynaptic trace x, assembly patterns, and params (pickled).
+    """
+    pkl = pickle.dumps(params_dict, protocol=pickle.HIGHEST_PROTOCOL)
+    np.savez_compressed(
+        filepath,
+        format_version=_MODEL_NPZ_VERSION,
+        params_pickle=np.frombuffer(pkl, dtype=np.uint8),
+        t_end_s=np.float64(t_end_s),
+        use_istdp=np.int8(1 if use_istdp else 0),
+        N_E=np.int32(int(params_dict['N_E'])),
+        N_I=np.int32(int(params_dict['N_I'])),
+        patterns=np.asarray(patterns_arr, dtype=np.uint8),
+        i_ee=np.asarray(Syn_EE.i[:], dtype=np.int32),
+        j_ee=np.asarray(Syn_EE.j[:], dtype=np.int32),
+        g_EE=np.asarray(Syn_EE.g_EE[:] / nS, dtype=np.float64),
+        g_EE_start=np.asarray(g_EE_start_arr, dtype=np.float64),
+        x_ee=np.asarray(Syn_EE.x[:], dtype=np.float64),
+        delay_ee=np.asarray(Syn_EE.delay[:] / second, dtype=np.float64),
+        i_ei=np.asarray(Syn_EI.i[:], dtype=np.int32),
+        j_ei=np.asarray(Syn_EI.j[:], dtype=np.int32),
+        g_EI=np.asarray(Syn_EI.g_EI[:] / nS, dtype=np.float64),
+        delay_ei=np.asarray(Syn_EI.delay[:] / second, dtype=np.float64),
+        i_ie=np.asarray(Syn_IE.i[:], dtype=np.int32),
+        j_ie=np.asarray(Syn_IE.j[:], dtype=np.int32),
+        g_IE=np.asarray(Syn_IE.g_IE[:] / nS, dtype=np.float64),
+        delay_ie=np.asarray(Syn_IE.delay[:] / second, dtype=np.float64),
+        i_ii=np.asarray(Syn_II.i[:], dtype=np.int32),
+        j_ii=np.asarray(Syn_II.j[:], dtype=np.int32),
+        g_II=np.asarray(Syn_II.g_II[:] / nS, dtype=np.float64),
+        delay_ii=np.asarray(Syn_II.delay[:] / second, dtype=np.float64),
+    )
+
 
 def _setup_codegen(use_cython=True):
     """Prefer Cython for speed; fall back to numpy if Brian2's Cython isn't available."""
@@ -47,12 +97,20 @@ def run_full_simulation(
     params_overrides=None,
     use_istdp=True,
     record_interval_s=1.0,
+    save_model=True,
+    model_path=None,
+    freeze_spontaneous_weights=True,
 ):
     """
     use_istdp: if False, J_EI fixed at initial (Fig 3 comparison).
     record_interval_s: sample W_in/W_out every this many seconds.
+    freeze_spontaneous_weights: if True (default), at the start of Phase 3 turn off EE/EI
+    plasticity and EE row-sum normalization so weights are frozen during spontaneous activity.
+    If False, learning and normalization continue (W_in/W_out will drift; matches unfrozen Julia runs).
     save_dir: if None, use neural_ensembles/results (relative to this script) so the same
               folder is used regardless of current working directory.
+    save_model: if True, also write model_<suffix>.npz (weights, delays, connectivity, params).
+    model_path: full path for that .npz; default save_dir/model_<suffix>.npz.
     """
     if save_dir is None:
         save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
@@ -135,7 +193,7 @@ def run_full_simulation(
         sp_E, sp_I, norm_op,
     ]
     b2_net = Network(*objects)
-    report_period = 5 * second
+    report_period = 0.5 * second
 
     # ----- Phase 1: Warmup -----
     print('Phase 1: Warmup (plasticity off)')
@@ -207,6 +265,13 @@ def run_full_simulation(
     phase3_total_s = spontaneous_duration_s
     phase3_next_report_s = phase_report_interval_s  # first update at 10 s
     print('Phase 3: Spontaneous %.0f s total' % phase3_total_s)
+    if freeze_spontaneous_weights:
+        Syn_EE.plasticity_on = 0
+        Syn_EI.plasticity_on = 0
+        normalization_active[0] = False
+        print('  Weights frozen (plasticity + EE row-sum norm off) for spontaneous phase.')
+    else:
+        print('  WARNING: plasticity and normalization still ON during spontaneous (weights can drift).')
     Poisson_E.rates = nu_baseline
     t_end = t_training_end + spontaneous_duration_s
     while float(defaultclock.t / second) < t_end:
@@ -235,6 +300,25 @@ def run_full_simulation(
     os.makedirs(save_dir, exist_ok=True)
     suffix = 'no_istdp' if not use_istdp else 'with_istdp'
     t_warmup_s = float(p['t_warmup_no_plasticity'] / second)
+    t_end_s = float(defaultclock.t / second)
+
+    model_npz_path = None
+    if save_model:
+        model_npz_path = model_path or os.path.join(save_dir, 'model_%s.npz' % suffix)
+        save_trained_model_npz(
+            model_npz_path,
+            p,
+            Syn_EE,
+            Syn_EI,
+            net['Syn_IE'],
+            net['Syn_II'],
+            g_EE_start,
+            patterns,
+            use_istdp,
+            t_end_s,
+        )
+        print('Saved trained model to %s' % model_npz_path)
+
     results = {
         'params': p,
         'i_ee': i_ee, 'j_ee': j_ee,
@@ -254,11 +338,15 @@ def run_full_simulation(
         'phase2_total_s': phase2_total_s,
         'spontaneous_duration_s': spontaneous_duration_s,
         'use_istdp': use_istdp,
+        'freeze_spontaneous_weights': freeze_spontaneous_weights,
+        'model_npz_path': model_npz_path,
+        't_end_s': t_end_s,
     }
     path = os.path.join(save_dir, 'assembly_%s.pkl' % suffix)
     with open(path, 'wb') as f:
         pickle.dump(results, f, protocol=pickle.HIGHEST_PROTOCOL)
     print('Saved to %s' % path)
+
     return results
 
 
@@ -271,8 +359,11 @@ if __name__ == '__main__':
         args.remove('--cpp')
         set_device('cpp_standalone', build_on_run=False)
 
-    # Compounding: any combination of --quick, --small, --no-istdp, plus optional --cpp
+    # Compounding: any combination of --quick, --small, --no-istdp, --no-model, plus optional --cpp
     use_istdp = '--no-istdp' not in args
+    save_model = '--no-model' not in args
+    # Allow continued plasticity during spontaneous (not default; W traces will drift)
+    freeze_spontaneous_weights = '--plastic-during-spontaneous' not in args
 
     # Default run (full protocol)
     n_block_repeats = 20
@@ -304,4 +395,6 @@ if __name__ == '__main__':
         record_interval_s=record_interval_s,
         use_istdp=use_istdp,
         params_overrides=params_overrides if params_overrides else None,
+        save_model=save_model,
+        freeze_spontaneous_weights=freeze_spontaneous_weights,
     )

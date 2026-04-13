@@ -1,6 +1,4 @@
-"""
-Utility functions for the poster network and analysis.
-"""
+"""Helpers for the poster network."""
 import pickle
 import numpy as np
 from brian2 import second
@@ -61,7 +59,8 @@ def normal_weights(mean_current, n, weightCV, rng):
 def save_network_checkpoint(filepath, params):
     """
     Save a weights-only checkpoint: weight_matrix_post and dimensions (nExc, nInh).
-    Params should already contain weight_matrix_post, nExc, nInh (e.g. after a run).
+    Entries are conductances in siemens (float). Params should already contain
+    weight_matrix_post, nExc, nInh (e.g. after a run).
     """
     data = {
         'checkpoint_type': 'weights',
@@ -86,3 +85,51 @@ def load_weights_checkpoint(filepath):
         int(data['nExc']),
         int(data['nInh']),
     )
+
+
+def cs_us_ns_pattern_matrix(n_exc, cs_inds, us_inds):
+    """
+    Boolean (3, n_exc): rows are mutually exclusive membership for CS, US, and NS
+    (non-stimulated excitatory), same grouping as the raster in plotting.SimpleResults.
+    """
+    cs = np.zeros(int(n_exc), dtype=bool)
+    us = np.zeros(int(n_exc), dtype=bool)
+    ci = np.asarray(cs_inds, dtype=np.int64)
+    ui = np.asarray(us_inds, dtype=np.int64)
+    cs[ci] = True
+    us[ui] = True
+    ns = ~(cs | us)
+    return np.stack([cs, us, ns], axis=0)
+
+
+def compute_W_in_W_out_per_assembly(g_EE, i_ee, j_ee, patterns):
+    """W_in[k]: mean w>0 on j→i with both ends in k. W_out[k]: mean w>0 on j→i with pre in k, post not."""
+    g_EE = np.asarray(g_EE, dtype=np.float64).ravel()
+    i_ee = np.asarray(i_ee, dtype=np.int64).ravel()
+    j_ee = np.asarray(j_ee, dtype=np.int64).ravel()
+    n_patterns, _ = patterns.shape
+
+    W_in_per_assembly = []
+    W_out_per_assembly = []
+    for k in range(n_patterns):
+        if not np.any(patterns[k, :]):
+            W_in_per_assembly.append(np.nan)
+            W_out_per_assembly.append(np.nan)
+            continue
+        w_in_list = []
+        w_out_list = []
+        for idx in range(len(g_EE)):
+            w = float(g_EE[idx])
+            if w <= 0.0:
+                continue
+            pre = int(i_ee[idx])
+            post = int(j_ee[idx])
+            pre_k = bool(patterns[k, pre])
+            post_k = bool(patterns[k, post])
+            if pre_k and post_k:
+                w_in_list.append(w)
+            elif pre_k and not post_k:
+                w_out_list.append(w)
+        W_in_per_assembly.append(np.mean(w_in_list) if len(w_in_list) >= 2 else np.nan)
+        W_out_per_assembly.append(np.mean(w_out_list) if w_out_list else np.nan)
+    return W_in_per_assembly, W_out_per_assembly
