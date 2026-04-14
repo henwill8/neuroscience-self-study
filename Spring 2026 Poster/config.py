@@ -2,8 +2,9 @@
 Default network parameters. Call get_default_params() for a copy with derived fields set.
 
 Synaptic weights are conductances (siemens); recurrent drive matches Litwin–Kumar & Doiron sim.jl
-(difference-of-exponentials E/I filters, ge*(E_e-v)/C, gi*(E_i-v)/C). I→E weights support iSTDP
-as in sim.jl (use_istdp, istdp_tau_y, istdp_eta, istdp_r0, g_min_EI, g_max_EI).
+(difference-of-exponentials E/I filters, ge*(E_e-v)/C, gi*(E_i-v)/C). E→E vSTDP uses the Methods
+values A_LTD = 0.0008 pA·mV⁻¹ and A_LTP = 0.0014 pA·mV⁻² (mapped to siemens updates as in sim.jl).
+I→E weights support iSTDP as in sim.jl (use_istdp, istdp_tau_y, istdp_eta, istdp_r0, g_min_EI, g_max_EI).
 """
 from brian2 import *
 from utils import trial_duration
@@ -28,11 +29,11 @@ def get_default_params():
         'reportPeriod': 10 * second,
         'doProfile': True,
 
-        'nTrials': 20,
+        'nTrials': 1,
         'ISI': 360 * ms,
         'propCS': 0.05,
         'propUS': 0.05,
-        'interTrialInterval': 0.5 * second,
+        'interTrialInterval': 1 * second,
         # Baseline / setup time before trial 0 CS onset (added to total simulation duration).
         'pre_first_trial_delay': 10 * ms,
         'include_CS_only_trial': True,
@@ -44,32 +45,18 @@ def get_default_params():
         # CS/US: conductance step per input spike (Julia jex=1.78 in weight units; our pulse train needs
         # larger nS/step when conductance_ge_scale is subcritical — tune with conductance_ge_scale).
         'spikeInputAmplitude': 8 * nS,
-        # Optional stronger drive to CS/US populations (defaults fall back to spikeInputAmplitude).
-        'spikeInputAmplitude_CS': 300 * nS,
-        'spikeInputAmplitude_US': 300 * nS,
-        # 'sustained': short rectangular conductance at each nominal spike time (CS_Hz / US_Hz within
-        #   CS_train_duration / US_train_duration); width = sustained_input_width_* (not full epoch).
-        # 'pulse_train': discrete spikes into the synaptic filter; shading uses full epoch intervals.
-        'cs_us_stimulus_mode': 'sustained',
-        # Plateau conductance during each short window (None → spikeInputAmplitude_CS / _US).
-        'sustained_conductance_CS': None,
-        'sustained_conductance_US': None,
-        # Length of each sustained conductance pulse (replaces one discrete input spike).
-        'sustained_input_width_CS': 20 * ms,
-        'sustained_input_width_US': 10 * ms,
-        # Linear ramp from 0 at each pulse onset (0 = step on; use < pulse width, e.g. 3–8 ms).
-        'sustained_input_ramp_CS': 5 * ms,
-        'sustained_input_ramp_US': 5 * ms,
-        # Desynchronize CS/US-driven E cells: per-neuron gain ~ 1 + N(0, cv) (clipped), plus optional fast xi_2.
-        'sustained_input_gain_cv_CS': 1,
-        'sustained_input_gain_cv_US': 1,
-        'sustained_input_gain_min': 0.25,
-        # Extra additive xi_2 during CS/US gates (0 = off); scales like membrane noise (noiseSigma, Cm, gl).
-        'sustained_input_additive_noise_scale': 0.5,
+        # Feedforward CS/US: SpikeGenerator → E synapses at CS_Hz / US_Hz (see network._build_cs_us_input).
+        'spikeInputAmplitude_CS': 200 * nS,
+        'spikeInputAmplitude_US': 200 * nS,
+        # Per-neuron Gaussian jitter (s) on each input spike time. Upper-clipped to train end only
+        # (no floor at train onset) so the first pulse can fire earlier and stay desynchronized.
+        # 0 = synchronized pulses across the group. Use enough pre_first_trial_delay if times must stay >= 0.
+        'CS_input_jitter_std': 5 * ms,
+        'US_input_jitter_std': 5 * ms,
 
-        'nUnits': 5e3,
+        'nUnits': 2e3,
         'propInh': 0.20,
-        'propConnect': 0.15,
+        'propConnect': 0.25,
 
         # E: EIF; C and gL chosen so C/gL = 20 ms like sim.jl (taue=20, C=300, g=15 in paper units).
         'eLeakExc': -70 * mV,
@@ -120,6 +107,11 @@ def get_default_params():
         'tauu_vstdp': 10 * ms,
         'tauv_vstdp': 7 * ms,
         'taux_vstdp': 15 * ms,
+        # vSTDP strengths (LTD: S/V, LTP: S/V^2). LTP multiplies by dt in ms in network.py to
+        # match sim.jl's dt*altp*x*(v-thetaltp)*(v_lp-thetaltd) scaling.
+        'altd_vstdp': 8e-10 * siemens / volt,
+        'altp_vstdp': 1.4e-5 * siemens / (volt * volt),
+        'thetaltd_vstdp': -70 * mV,
         'thetaltp_vstdp': -49 * mV,
         'stdp_delay': 0 * second,
         'g_min_EE': 0 * nS,
@@ -139,6 +131,12 @@ def get_default_params():
 
         'record_ee_w_stats': True,
         'w_stats_record_dt': 0.5 * second,
+        # Manual trial-end rule for NS->US EE weights:
+        # after each trial, NS neurons that fired in the US window potentiate NS->US;
+        # NS neurons that did not fire in that window depress NS->US.
+        'manual_ns_us_trial_learning': False,
+        'manual_ns_us_trial_pot_delta': 0.3 * nS,
+        'manual_ns_us_trial_dep_delta': 0.3 * nS,
 
         # sim.jl tauerise/tauedecay/tauirise/tauidecay (ms)
         'tauRiseExc': 1 * ms,
@@ -155,9 +153,5 @@ def get_default_params():
         'checkpoint_path': 'results/istdp_network_checkpoint.pkl',
         'load_checkpoint_path': None,
     }
-    _w0 = 10.0
-    params['altd_vstdp'] = float(0.0008) * params['gEE'] / (_w0 * mV)
-    params['altp_vstdp'] = float(0.0014) * params['gEE'] / (_w0 * mV * mV)
-    params['thetaltd_vstdp'] = params['eLeakExc']
     derive_trial_params(params)
     return params

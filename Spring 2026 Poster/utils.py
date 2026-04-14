@@ -26,6 +26,39 @@ def pulse_times_train(trial_starts_s, train_duration_s, freq_Hz):
     return np.array(times)
 
 
+def jittered_pulse_spike_times(n_sources, pulse_times_s, epoch_starts_s, train_duration_s, jitter_std_s, rng):
+    """
+    Indices and spike times (seconds) for a SpikeGeneratorGroup of size n_sources.
+
+    Each source receives every nominal pulse in pulse_times_s, with independent Gaussian jitter.
+    Times are only upper-clipped to epoch_start + train_duration_s (per pulse's epoch); there is
+    no lower clip at epoch_start, so negative jitter can move pulses earlier (e.g. the first
+    pulse of a train is not forced synchronous at the boundary). If jitter_std_s <= 0, all sources
+    share the nominal times (synchronized drive).
+
+    Ensure pre_first_trial_delay (and US timing) leave enough margin if your simulator requires
+    spike times >= 0.
+
+    Returned arrays are sorted by time for Brian2.
+    """
+    pulse_times_s = np.asarray(pulse_times_s, dtype=np.float64).ravel()
+    epoch_starts_s = np.asarray(epoch_starts_s, dtype=np.float64).ravel()
+    n_p = int(pulse_times_s.size)
+    if n_p == 0 or int(n_sources) <= 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+    jit = float(jitter_std_s)
+    if jit <= 0.0:
+        idx = np.repeat(np.arange(n_sources, dtype=np.int64), n_p)
+        t = np.tile(pulse_times_s, n_sources)
+    else:
+        noise = rng.normal(0.0, jit, size=(int(n_sources), n_p))
+        t_mat = pulse_times_s + noise
+        idx = np.repeat(np.arange(n_sources, dtype=np.int64), n_p)
+        t = t_mat.ravel(order='C')
+    order = np.argsort(t, kind='mergesort')
+    return idx[order], t[order]
+
+
 def adjacency_indices_within(nUnits, pConn, rng):
     """Random connectivity within a population (no autapses). Returns (preInds, postInds)."""
     bestNumberOfSynapses = int(np.round(pConn * nUnits ** 2))

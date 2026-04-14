@@ -11,11 +11,29 @@ from mpl_toolkits.mplot3d import Axes3D
 BLACK_YELLOW_CMAP = LinearSegmentedColormap.from_list('black_yellow', ['black', 'yellow'], N=256)
 
 
+def _mean_per_neuron_binned_rate_hz(spike_times, spike_indices, neuron_ids, bins, bin_size_s):
+    """
+    Per time bin: average over neurons in ``neuron_ids`` of each neuron's rate (spikes in bin / bin_width).
+    Neurons with no spikes in a bin contribute 0 Hz; silent neurons are included in the mean.
+    """
+    spike_times = np.asarray(spike_times, dtype=float)
+    spike_indices = np.asarray(spike_indices, dtype=np.int64)
+    neuron_ids = np.asarray(neuron_ids, dtype=np.int64).ravel()
+    n_bins = len(bins) - 1
+    if neuron_ids.size == 0:
+        return np.zeros(n_bins, dtype=float)
+    acc = np.zeros(n_bins, dtype=float)
+    for nid in neuron_ids:
+        tn = spike_times[spike_indices == nid]
+        counts, _ = np.histogram(tn, bins)
+        acc += counts.astype(float) / float(bin_size_s)
+    return acc / float(neuron_ids.size)
+
+
 def draw_cs_us_stimulus_spans(ax, p, zorder=0, legend_label=True):
     """
-    Shade CS/US intervals from params cs_stim_intervals_s, us_stim_intervals_s (each row [t0, t1] s).
-    Sustained mode: short windows per nominal pulse; pulse_train mode: full epoch per trial.
-    Trial-level envelopes (if needed): cs_stim_epoch_intervals_s, us_stim_epoch_intervals_s.
+    Shade CS/US train windows from params cs_stim_intervals_s, us_stim_intervals_s (each row [t0, t1] s).
+    Same as trial-level cs_stim_epoch_intervals_s / us_stim_epoch_intervals_s after scheduling.
     """
     labeled_cs = False
     labeled_us = False
@@ -59,8 +77,9 @@ def draw_cs_us_stimulus_spans(ax, p, zorder=0, legend_label=True):
 
 def draw_cs_us_stimulus_pulse_lines(ax, p, zorder=2, legend_label=True):
     """
-    Vertical line at each external CS/US input spike time (params cs_stim_pulse_times_s,
-    us_stim_pulse_times_s from Network._build_cs_us_input).
+    Vertical line at each nominal CS/US input pulse time (cs_stim_pulse_times_s, us_stim_pulse_times_s).
+    Actual SpikeGenerator times are jittered per neuron when CS_input_jitter_std / US_input_jitter_std > 0
+    (upper-clipped to train end only, not to train onset).
     """
     labeled_cs = False
     labeled_us = False
@@ -229,28 +248,10 @@ def compute_within_between_correlations(results, bin_size=5*ms):
     return out
 
 
-def compute_pca_variance_explained(results, bin_size=5*ms, use_exc_only=True,
-                                   use_upstate_only=False, upstate_bin_size=10*ms,
-                                   p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0):
-    """Variance explained by each PC (%). Returns 1d array."""
+def compute_pca_variance_explained(results, bin_size=5*ms, use_exc_only=True):
+    """Variance explained by each PC (%). Full simulation; no upstate masking."""
     X = compute_population_matrix(results, bin_size, use_exc_only, subtract_mean=False)
-    if use_upstate_only:
-        _, upstate_mask_coarse = detect_upstates(results, bin_size=upstate_bin_size, use_exc_only=use_exc_only,
-                                                  p_stay=p_stay, rate_up_ratio=rate_up_ratio, rate_down_ratio=rate_down_ratio)
-        upstate_bin_size_s = float(upstate_bin_size / second)
-        bin_size_s = float(bin_size / second)
-        bins = np.arange(0, results.duration, bin_size_s)
-        centers = bins[:-1] + bin_size_s / 2
-        upstate_mask = np.zeros(len(centers), dtype=bool)
-        for i in range(len(centers)):
-            k = min(int(centers[i] / upstate_bin_size_s), len(upstate_mask_coarse) - 1)
-            if k >= 0:
-                upstate_mask[i] = upstate_mask_coarse[k]
-        if np.any(upstate_mask):
-            X = X[upstate_mask] - X[upstate_mask].mean(axis=0)
-        # else X stays as-is; svd of empty will be handled below
-    else:
-        X = X - X.mean(axis=0)
+    X = X - X.mean(axis=0)
     if X.shape[0] < 2:
         return np.full(3, np.nan)  # not enough data for variance explained
     U, S, Vt = np.linalg.svd(X, full_matrices=False)
@@ -550,6 +551,7 @@ class SimpleResults:
 
     def plot_firing_rate(self, ax, bin_size=5*ms, show_upstate=True,
                          upstate_bin_size=10*ms, p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0):
+        """Per time bin: mean over neurons in each group of that neuron's binned rate (Hz)."""
         bin_size_s = float(bin_size / second)
         bins = np.arange(0, self.duration, bin_size_s)
         centers = bins[:-1] + bin_size_s / 2
@@ -582,33 +584,32 @@ class SimpleResults:
             us_set = set(self.p['us_neuron_inds'])
             nCS, nUS = len(cs_set), len(us_set)
             nNS = nExc - nCS - nUS
+            # One matrix (n_bins, nExc): each column is one neuron's binned rate (Hz).
+            rates_exc = compute_population_matrix(self, bin_size, use_exc_only=True, subtract_mean=False)
             if nCS > 0:
-                mask_cs = np.isin(self.spikeMonExcI, self.p['cs_neuron_inds'])
-                t_cs = self.spikeMonExcT[mask_cs]
-                FR_CS, _ = np.histogram(t_cs, bins)
-                FR_CS = FR_CS / bin_size_s / nCS
+                cs_ids = np.sort(np.asarray(self.p['cs_neuron_inds'], dtype=np.int64).ravel())
+                FR_CS = rates_exc[:, cs_ids].mean(axis=1)
                 ax.plot(centers, FR_CS, color='C3', alpha=0.8, label='CS')
             if nUS > 0:
-                mask_us = np.isin(self.spikeMonExcI, self.p['us_neuron_inds'])
-                t_us = self.spikeMonExcT[mask_us]
-                FR_US, _ = np.histogram(t_us, bins)
-                FR_US = FR_US / bin_size_s / nUS
+                us_ids = np.sort(np.asarray(self.p['us_neuron_inds'], dtype=np.int64).ravel())
+                FR_US = rates_exc[:, us_ids].mean(axis=1)
                 ax.plot(centers, FR_US, color='C0', alpha=0.8, label='US')
             if nNS > 0:
-                ns_set = set(range(nExc)) - cs_set - us_set
-                mask_ns = np.isin(self.spikeMonExcI, np.array(list(ns_set)))
-                t_ns = self.spikeMonExcT[mask_ns]
-                FR_ns, _ = np.histogram(t_ns, bins)
-                FR_ns = FR_ns / bin_size_s / nNS
+                ns_ids = np.sort(np.array([i for i in range(nExc) if i not in cs_set and i not in us_set], dtype=np.int64))
+                FR_ns = rates_exc[:, ns_ids].mean(axis=1)
                 ax.plot(centers, FR_ns, color='0.6', alpha=0.6, label='NS')
-            FRInh, _ = np.histogram(self.spikeMonInhT, bins)
-            FRInh = FRInh / bin_size_s / nInh
+            t_inh = np.asarray(self.spikeMonInhT, dtype=float)
+            i_inh = np.asarray(self.spikeMonInhI, dtype=np.int64)
+            inh_ids = np.arange(nInh, dtype=np.int64)
+            FRInh = _mean_per_neuron_binned_rate_hz(t_inh, i_inh, inh_ids, bins, bin_size_s)
             ax.plot(centers, FRInh, color='red', alpha=0.6, label='inh')
         else:
-            FRExc, _ = np.histogram(self.spikeMonExcT, bins)
-            FRInh, _ = np.histogram(self.spikeMonInhT, bins)
-            FRExc = FRExc / bin_size_s / nExc
-            FRInh = FRInh / bin_size_s / nInh
+            rates_exc = compute_population_matrix(self, bin_size, use_exc_only=True, subtract_mean=False)
+            FRExc = rates_exc.mean(axis=1)
+            t_inh = np.asarray(self.spikeMonInhT, dtype=float)
+            i_inh = np.asarray(self.spikeMonInhI, dtype=np.int64)
+            inh_ids = np.arange(nInh, dtype=np.int64)
+            FRInh = _mean_per_neuron_binned_rate_hz(t_inh, i_inh, inh_ids, bins, bin_size_s)
             ax.plot(centers, FRExc, color='cyan', alpha=0.6)
             ax.plot(centers, FRInh, color='red', alpha=0.6)
 
@@ -725,39 +726,20 @@ class SimpleResults:
         return ax
 
     def plot_pca_3d_time_color(self, ax=None, bin_size=5*ms, use_exc_only=True,
-                               use_upstate_only=True, upstate_bin_size=10*ms,
-                               p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0,
                                line_alpha=0.85, line_lw=0.8, cmap='viridis'):
         bin_size_s = float(bin_size / second)
         bins = np.arange(0, self.duration, bin_size_s)
         centers = bins[:-1] + bin_size_s / 2
         X = compute_population_matrix(self, bin_size, use_exc_only, subtract_mean=False)
+        X_use = X - X.mean(axis=0)
+        centers_use = centers
 
-        if use_upstate_only:
-            _, upstate_mask_coarse = detect_upstates(self, bin_size=upstate_bin_size, use_exc_only=use_exc_only,
-                                                     p_stay=p_stay, rate_up_ratio=rate_up_ratio, rate_down_ratio=rate_down_ratio)
-            upstate_bin_size_s = float(upstate_bin_size / second)
-            upstate_mask = np.zeros(len(centers), dtype=bool)
-            for i in range(len(centers)):
-                k = min(int(centers[i] / upstate_bin_size_s), len(upstate_mask_coarse) - 1)
-                if k >= 0:
-                    upstate_mask[i] = upstate_mask_coarse[k]
-            if not np.any(upstate_mask):
-                X_use = np.empty((0, X.shape[1]))
-                centers_use = np.array([])
-            else:
-                X_use = X[upstate_mask] - X[upstate_mask].mean(axis=0)
-                centers_use = centers[upstate_mask]
-            if X_use.shape[0] < 2:
-                if ax is None:
-                    fig, ax = plt.subplots(subplot_kw=dict(projection='3d'))
-                ax.set_title("First 3 PCs (upstate only; no upstate bins)")
-                return ax
-        else:
-            X_use = X - X.mean(axis=0)
-            centers_use = centers
-
-        U, S, Vt = np.linalg.svd(X_use, full_matrices=False)
+        if X_use.shape[0] < 2:
+            if ax is None:
+                fig, ax = plt.subplots(subplot_kw=dict(projection='3d'))
+            ax.set_title("First 3 PCs (insufficient time bins)")
+            return ax
+        _, _, Vt = np.linalg.svd(X_use, full_matrices=False)
         proj = X_use @ Vt[:3].T
         for j in range(3):
             col = proj[:, j]
@@ -777,7 +759,7 @@ class SimpleResults:
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.set_zlabel("PC3")
-        ax.set_title("First 3 PCs (upstate only)" if use_upstate_only else "First 3 PCs (full simulation)")
+        ax.set_title("First 3 PCs (full simulation)")
         plt.colorbar(sm, ax=ax, shrink=0.6, label="Time (s)")
         return ax
 
@@ -801,13 +783,8 @@ class SimpleResults:
         return ax
 
     def plot_pca_variance(self, ax=None, bin_size=5*ms, use_exc_only=True,
-                         use_upstate_only=False, upstate_bin_size=10*ms,
-                         p_stay=0.9, rate_up_ratio=3.0, rate_down_ratio=1.0,
                          max_components=50, bar=True):
-        var_pct = compute_pca_variance_explained(
-            self, bin_size, use_exc_only, use_upstate_only, upstate_bin_size,
-            p_stay, rate_up_ratio, rate_down_ratio
-        )
+        var_pct = compute_pca_variance_explained(self, bin_size, use_exc_only)
         n_show = min(max_components, len(var_pct))
         var_pct = var_pct[:n_show]
         if ax is None:
@@ -819,8 +796,7 @@ class SimpleResults:
             ax.plot(x, var_pct, 'o-', color='steelblue', markersize=3)
         ax.set_xlabel("Principal component")
         ax.set_ylabel("Variance explained (%)")
-        title = "PCA variance explained (upstate only)" if use_upstate_only else "PCA variance explained (full)"
-        ax.set_title(title)
+        ax.set_title("PCA variance explained (full simulation)")
         return ax
 
     def plot_pca_centroid_trajectories(self, bin_size=5*ms, n_components=3,
@@ -1084,9 +1060,9 @@ def plot_all_figures(results, show=True):
     ax_pca = fig2.add_subplot(gs[0], projection='3d')
     ax_corr = fig2.add_subplot(gs[1])
     ax_var = fig2.add_subplot(gs[2])
-    results.plot_pca_3d_time_color(ax=ax_pca, use_upstate_only=True)
+    results.plot_pca_3d_time_color(ax=ax_pca)
     results.plot_within_between_correlations(ax=ax_corr)
-    results.plot_pca_variance(ax=ax_var, use_upstate_only=True)
+    results.plot_pca_variance(ax=ax_var)
     fig2.tight_layout()
 
     # Figure 3: weight change by block

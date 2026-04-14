@@ -12,6 +12,7 @@ from config import get_default_params
 from plotting import SimpleResults, plot_all_figures
 from utils import (
     pulse_times_train,
+    jittered_pulse_spike_times,
     adjacency_indices_within,
     adjacency_indices_between,
     normal_weights,
@@ -26,9 +27,10 @@ STDP_BLOCK_KEYS = ['CS_CS', 'CS_US', 'CS_NS', 'US_CS', 'US_US', 'US_NS', 'NS_CS'
 
 
 # int(...) avoids Relational-in-Mul in Brian's sympy pass for run_regularly.
+# Matches sim.jl LTP: weights[dd,cc] += dt*altp*x[dd]*(v[cc]-thetaltp)*(v_vstdp[cc]-thetaltd) for pre dd -> post cc.
 _EE_VSTDP_LTP_RUN_REG = (
     'gEE = clip(gEE + block_stdp * int(t > stdp_delay) * int(gEE > 0*siemens) * int(v_post > thetaltp_vstdp) * '
-    'int(v_lp_vstdp_post > thetaltd_vstdp) * altp_vstdp * vstdp_ltp_dt * x_vstdp_pre * '
+    'int(v_lp_vstdp_post > thetaltd_vstdp) * altp_vstdp * vstdp_ltp_dt_ms * x_vstdp_pre * '
     '(v_post - thetaltp_vstdp) * (v_lp_vstdp_post - thetaltd_vstdp), g_min_EE, g_max_EE)'
 )
 
@@ -38,10 +40,12 @@ def _configure_ee_voltage_stdp_ltp(synapsesEE, p):
     synapsesEE.namespace['thetaltp_vstdp'] = p['thetaltp_vstdp']
     synapsesEE.namespace['thetaltd_vstdp'] = p['thetaltd_vstdp']
     synapsesEE.namespace['altp_vstdp'] = p['altp_vstdp']
-    synapsesEE.namespace['vstdp_ltp_dt'] = p['dt']
+    # sim.jl uses dt in ms in the LTP term; keep that effective scaling.
+    synapsesEE.namespace['vstdp_ltp_dt_ms'] = float(p['dt'] / ms)
     synapsesEE.namespace['g_min_EE'] = p['g_min_EE']
     synapsesEE.namespace['g_max_EE'] = p['g_max_EE']
-    synapsesEE.run_regularly(_EE_VSTDP_LTP_RUN_REG, dt=p['dt'])
+    # when='end': use membrane v after integration this step (Julia applies LTP after voltage update in same tt loop).
+    synapsesEE.run_regularly(_EE_VSTDP_LTP_RUN_REG, dt=p['dt'], when='end')
 
 
 def _ee_positive_indegree_per_post(synapsesEE, n_exc):
@@ -120,65 +124,6 @@ def _ee_stdp_use_flags(pre_inds, post_inds, cs_inds, us_inds, stdp_blocks):
     return use
 
 
-def _pulse_envelope_linear_rise(t_k, t0, t1, ramp_s):
-    """
-    Per-pulse scalar gate in [0, 1] at times t_k (s): linear rise from 0 at t0 over ramp_s,
-    then 1 until t1. If pulse width < ramp_s, rises linearly from 0 at t0 to 1 at t1.
-    """
-    t0, t1 = float(t0), float(t1)
-    if t1 < t0:
-        t0, t1 = t1, t0
-    W = t1 - t0
-    r = float(ramp_s)
-    env = np.zeros_like(t_k, dtype=np.float64)
-    if W <= 0 or r <= 0:
-        env[(t_k >= t0) & (t_k <= t1)] = 1.0
-        return env
-    if W >= r:
-        rise_end = t0 + r
-        m_rise = (t_k >= t0) & (t_k < rise_end)
-        env[m_rise] = (t_k[m_rise] - t0) / r
-        env[(t_k >= rise_end) & (t_k <= t1)] = 1.0
-        return env
-    m = (t_k >= t0) & (t_k <= t1)
-    env[m] = (t_k[m] - t0) / W
-    return env
-
-
-def _scalar_stimulus_gates_from_intervals(intervals_s, duration_s, dt_s, ramp_s=0.0):
-    """
-    Gate sampled each dt_s: in [0, 1], max over intervals. Each row [t0, t1] in seconds.
-    ramp_s == 0: rectangular (1 inside interval). ramp_s > 0: linear onset from 0 at t0.
-    """
-    intervals_s = np.asarray(intervals_s, dtype=np.float64).reshape(-1, 2)
-    n_steps = int(np.ceil(duration_s / dt_s)) + 2
-    t_k = np.arange(n_steps, dtype=np.float64) * dt_s
-    gate = np.zeros(n_steps, dtype=np.float64)
-    for row in intervals_s:
-        if row.size < 2:
-            continue
-        t0, t1 = float(row[0]), float(row[1])
-        if float(ramp_s) > 0:
-            gate = np.maximum(gate, _pulse_envelope_linear_rise(t_k, t0, t1, float(ramp_s)))
-        else:
-            if t1 < t0:
-                t0, t1 = t1, t0
-            gate = np.maximum(gate, ((t_k >= t0) & (t_k <= t1)).astype(np.float64))
-    return gate
-
-
-def _pulse_times_to_conductance_windows(times_s, width_s, t_clip_s):
-    """
-    Each nominal pulse time becomes [t, min(t + width, t_clip)] for a short sustained conductance.
-    times_s: 1d (s); width_s, t_clip_s in seconds.
-    """
-    times_s = np.asarray(times_s, dtype=np.float64).ravel()
-    if times_s.size == 0:
-        return np.zeros((0, 2), dtype=np.float64)
-    t_end = np.minimum(times_s + float(width_s), float(t_clip_s))
-    return np.column_stack([times_s, t_end]).astype(np.float64)
-
-
 def _build_weight_matrix(syn_EE, syn_EI, syn_IE, syn_II, nExc, nInh):
     """
     Build full weight matrix W (nUnits x nUnits), W[post, pre] = weight from pre to post.
@@ -232,7 +177,7 @@ class Network:
         p['nExc'] = int(p['nUnits'] - p['nInh'])
 
     def _prepare_cs_us_schedule(self):
-        """Set cs/us indices, trial metadata, plotting intervals, and sustained scalar gates (if used)."""
+        """Set CS/US neuron indices, trial metadata, nominal pulse times, and epoch intervals for plots."""
         p = self.params
         n_trials_total = self.n_trials_total
 
@@ -266,8 +211,8 @@ class Network:
             float(p['US_train_duration'] / second),
             float(p['US_Hz'] / Hz),
         )
-
         ISI_s = float(p['ISI'] / second)
+        p['_us_epoch_starts_s'] = np.asarray(trial_starts_for_US + ISI_s, dtype=np.float64)
         cs_only_trial_inds = []
         if every_n is not None and every_n >= 1:
             cs_only_trial_inds.extend([i for i in range(n_trials_paired) if (i + 1) % every_n == 0])
@@ -294,31 +239,10 @@ class Network:
         cs_only_set = set(cs_only_trial_inds)
         p['trial_conditions'] = np.array(['CS' if i in cs_only_set else 'US' for i in range(n_trials_total)])
 
-        mode = p.get('cs_us_stimulus_mode', 'sustained')
-        dur_s = float(p['duration'] / second)
-        dt_s = float(p['dt'] / second)
-        if mode == 'sustained':
-            w_cs = float(p.get('sustained_input_width_CS', 4 * ms) / second)
-            w_us = float(p.get('sustained_input_width_US', 4 * ms) / second)
-            ramp_cs_s = float(p.get('sustained_input_ramp_CS', 0 * ms) / second)
-            ramp_us_s = float(p.get('sustained_input_ramp_US', 0 * ms) / second)
-            p['cs_stim_intervals_s'] = _pulse_times_to_conductance_windows(cs_times_s, w_cs, dur_s)
-            p['us_stim_intervals_s'] = _pulse_times_to_conductance_windows(us_times_s, w_us, dur_s)
-            p['cs_stim_pulse_times_s'] = np.asarray(cs_times_s, dtype=np.float64).ravel()
-            p['us_stim_pulse_times_s'] = np.asarray(us_times_s, dtype=np.float64).ravel()
-            p['_sustained_cs_gate_seq'] = _scalar_stimulus_gates_from_intervals(
-                p['cs_stim_intervals_s'], dur_s, dt_s, ramp_cs_s
-            )
-            p['_sustained_us_gate_seq'] = _scalar_stimulus_gates_from_intervals(
-                p['us_stim_intervals_s'], dur_s, dt_s, ramp_us_s
-            )
-        else:
-            p['cs_stim_intervals_s'] = p['cs_stim_epoch_intervals_s']
-            p['us_stim_intervals_s'] = p['us_stim_epoch_intervals_s']
-            p['cs_stim_pulse_times_s'] = np.asarray(cs_times_s, dtype=np.float64).ravel()
-            p['us_stim_pulse_times_s'] = np.asarray(us_times_s, dtype=np.float64).ravel()
-            p['_sustained_cs_gate_seq'] = None
-            p['_sustained_us_gate_seq'] = None
+        p['cs_stim_intervals_s'] = p['cs_stim_epoch_intervals_s']
+        p['us_stim_intervals_s'] = p['us_stim_epoch_intervals_s']
+        p['cs_stim_pulse_times_s'] = np.asarray(cs_times_s, dtype=np.float64).ravel()
+        p['us_stim_pulse_times_s'] = np.asarray(us_times_s, dtype=np.float64).ravel()
 
         p['_cs_times_s_for_spikes'] = cs_times_s
         p['_us_times_s_for_spikes'] = us_times_s
@@ -367,30 +291,16 @@ class Network:
         )
         resetCodeInh = 'v = vReset' + ('; y_istdp += 1' if _use_istdp(p) else '')
 
-        use_sustained_cs_us = p.get('cs_us_stimulus_mode', 'sustained') == 'sustained'
         istdp_trace_exc = (
             '                dy_istdp/dt = -y_istdp / tau_istdp : 1\n'
             if _use_istdp(p)
             else ''
         )
-        stim_add_scale = float(p.get('sustained_input_additive_noise_scale', 0.0))
-        sustained_stim_add_noise = (
-            ' + sustained_input_additive_noise_scale * noiseSigma * (Cm / gl)**-0.5 * (cs_stim_mask * cs_stim_gate(t) + us_stim_mask * us_stim_gate(t)) * xi_2'
-            if use_sustained_cs_us and stim_add_scale != 0.0
-            else ''
-        )
         eif_dv_core = (
             '''
                 dv/dt = ((eLeak - v) + eif_dT * exp((v - vDynT) / eif_dT)) / tau_mem_e +
-                         (ge_syn * (e_rev_E - v) + gi_syn * (e_rev_I - v)'''
-            + (
-                ' + (g_cs_sust * cs_stim_mask * cs_stim_gain * cs_stim_gate(t) + g_us_sust * us_stim_mask * us_stim_gain * us_stim_gate(t)) * (e_rev_E - v)'
-                if use_sustained_cs_us
-                else ''
-            )
-            + ''' + gAdapt * (eif_gAdapt_reversal - v)) / Cm'''
-            + sustained_stim_add_noise
-            + '''
+                         (ge_syn * (e_rev_E - v) + gi_syn * (e_rev_I - v)
+                         + gAdapt * (eif_gAdapt_reversal - v)) / Cm
                          + noiseSigma * (Cm / gl)**-0.5 * xi : volt (unless refractory)
                 v_dep_adapt = 0.5 * (v - eLeak + abs(v - eLeak)) : volt
                 dgAdapt/dt = (eif_gAdapt_subthreshold_drive * v_dep_adapt - gAdapt) / eif_tau_w : siemens
@@ -411,13 +321,6 @@ class Network:
                 Cm : farad
                 '''
         )
-        if use_sustained_cs_us:
-            eif_dv_core = (
-                eif_dv_core.replace(
-                    'Cm : farad',
-                    'Cm : farad\n                cs_stim_mask : 1\n                us_stim_mask : 1\n                cs_stim_gain : 1\n                us_stim_gain : 1',
-                )
-            )
         eif_exc_core = conductance_filters + eif_dv_core
         unitModelExc = eif_exc_core.strip()
         resetCodeExc = 'v = vReset; vDynT += vth_bump; gAdapt += eif_gAdapt_spike'
@@ -428,12 +331,13 @@ class Network:
         if _use_homeostatic_run_regularly(p):
             unitModelExc = unitModelExc.strip() + '\n                S_ee_in : siemens\n                S_ee_target : siemens\n'
 
+        # vSTDP traces: u = low-pass v (tauu), v_lp = second low-pass v (tauv) as v_vstdp in sim.jl; x dimensionless with spike +1/tau_x as in Julia (x += 1/taux with taux in ms).
         unitModelExc = unitModelExc.strip() + '''
                 du_vstdp/dt = (v - u_vstdp) / tauu_vstdp : volt
                 dv_lp_vstdp/dt = (v - v_lp_vstdp) / tauv_vstdp : volt
-                dx_vstdp/dt = -x_vstdp / taux_vstdp : hertz
+                dx_vstdp/dt = -x_vstdp / taux_vstdp : 1
             '''
-        resetCodeExc = resetCodeExc + '; x_vstdp += 1/taux_vstdp'
+        resetCodeExc = resetCodeExc + '; x_vstdp += (1*ms)/taux_vstdp'
 
         threshCodeInh = 'v >= vThresh'
 
@@ -455,23 +359,6 @@ class Network:
             'tauv_vstdp': p['tauv_vstdp'],
             'taux_vstdp': p['taux_vstdp'],
         }
-        if use_sustained_cs_us:
-            g_cs = p.get('sustained_conductance_CS')
-            if g_cs is None:
-                g_cs = p.get('spikeInputAmplitude_CS', p['spikeInputAmplitude'])
-            g_us = p.get('sustained_conductance_US')
-            if g_us is None:
-                g_us = p.get('spikeInputAmplitude_US', p['spikeInputAmplitude'])
-            neuron_namespace['g_cs_sust'] = g_cs
-            neuron_namespace['g_us_sust'] = g_us
-            neuron_namespace['cs_stim_gate'] = TimedArray(
-                p['_sustained_cs_gate_seq'], dt=p['dt']
-            )
-            neuron_namespace['us_stim_gate'] = TimedArray(
-                p['_sustained_us_gate_seq'], dt=p['dt']
-            )
-            if stim_add_scale != 0.0:
-                neuron_namespace['sustained_input_additive_noise_scale'] = stim_add_scale
         if _use_istdp(p):
             neuron_namespace['tau_istdp'] = p['istdp_tau_y']
 
@@ -500,9 +387,7 @@ class Network:
         self._unitsExc.eLeak = p['eLeakExc']
         self._unitsExc.Cm = p['membraneCapacitanceExc']
         self._unitsExc.gl = p['gLeakExc']
-        vr = float(p['vResetExc'] / volt)
-        vt0 = float(p['vThreshExc'] / volt)
-        self._unitsExc.v = (vr + rng.random(p['nExc']) * (vt0 - vr)) * volt
+        self._unitsExc.v = p['eLeakExc']
         self._unitsExc.vDynT = p['vThreshExc']
         self._unitsExc.gAdapt = 0 * siemens
         self._unitsExc.v_soft_th0 = p['vThreshExc']
@@ -513,33 +398,9 @@ class Network:
         self._unitsExc.tau_vth_dyn = p['eif_tau_v_th']
         self._unitsExc.u_vstdp = p['vResetExc']
         self._unitsExc.v_lp_vstdp = p['vResetExc']
-        self._unitsExc.x_vstdp = 0 * Hz
+        self._unitsExc.x_vstdp = 0.0
         self._unitsExc.e_rev_E = p['eRevExcSyn']
         self._unitsExc.e_rev_I = p['eRevInhSyn']
-        if use_sustained_cs_us:
-            cs_m = np.zeros(p['nExc'], dtype=np.float64)
-            us_m = np.zeros(p['nExc'], dtype=np.float64)
-            cs_m[np.atleast_1d(p['cs_neuron_inds'])] = 1.0
-            us_m[np.atleast_1d(p['us_neuron_inds'])] = 1.0
-            self._unitsExc.cs_stim_mask = cs_m
-            self._unitsExc.us_stim_mask = us_m
-            cs_gain = np.ones(p['nExc'], dtype=np.float64)
-            us_gain = np.ones(p['nExc'], dtype=np.float64)
-            cv_cs = float(p.get('sustained_input_gain_cv_CS', 0.0))
-            cv_us = float(p.get('sustained_input_gain_cv_US', 0.0))
-            g_min = float(p.get('sustained_input_gain_min', 0.2))
-            cs_inds = np.atleast_1d(p['cs_neuron_inds']).astype(np.int64)
-            us_inds = np.atleast_1d(p['us_neuron_inds']).astype(np.int64)
-            if cv_cs > 0 and cs_inds.size > 0:
-                cs_gain[cs_inds] = np.clip(
-                    1.0 + cv_cs * rng.standard_normal(cs_inds.size), g_min, None
-                )
-            if cv_us > 0 and us_inds.size > 0:
-                us_gain[us_inds] = np.clip(
-                    1.0 + cv_us * rng.standard_normal(us_inds.size), g_min, None
-                )
-            self._unitsExc.cs_stim_gain = cs_gain
-            self._unitsExc.us_stim_gain = us_gain
 
         self._unitsInh.v = p['eLeakInh']
         self._unitsInh.vReset = p['vResetInh']
@@ -554,8 +415,9 @@ class Network:
             self._unitsInh.y_istdp = 0.0
 
     def _build_cs_us_input(self):
-        """SpikeGenerator CS/US (pulse_train mode) and optional NS perturb. Sustained mode skips CS/US spikes."""
+        """SpikeGenerator CS/US with optional per-neuron Gaussian jitter; optional NS perturb."""
         p = self.params
+        rng = self.rng
         n_trials_total = self.n_trials_total
         trial_starts_s = p['trial_starts_s']
         cs_neuron_inds = p['cs_neuron_inds']
@@ -565,36 +427,37 @@ class Network:
         cs_times_s = p['_cs_times_s_for_spikes']
         us_times_s = p['_us_times_s_for_spikes']
 
-        if p.get('cs_us_stimulus_mode', 'sustained') == 'pulse_train':
-            cs_indices_src = np.repeat(np.arange(nCS), len(cs_times_s))
-            cs_times_expanded = np.tile(cs_times_s, nCS)
-            us_indices_src = np.repeat(np.arange(nUS), len(us_times_s))
-            us_times_expanded = np.tile(us_times_s, nUS)
+        g_ref = p['conductance_filter_ref']
+        _on_pre_ext = 'x_e_rise_post += g_stim / g_filter_ref; x_e_decay_post += g_stim / g_filter_ref'
+        g_cs = p.get('spikeInputAmplitude_CS', p['spikeInputAmplitude'])
+        g_us = p.get('spikeInputAmplitude_US', p['spikeInputAmplitude'])
 
-            self._CS_group = SpikeGeneratorGroup(nCS, cs_indices_src, cs_times_expanded * second)
-            self._US_group = SpikeGeneratorGroup(nUS, us_indices_src, us_times_expanded * second)
+        cs_jit = float(p.get('CS_input_jitter_std', 0 * second) / second)
+        us_jit = float(p.get('US_input_jitter_std', 0 * second) / second)
+        cs_dur_s = float(p['CS_train_duration'] / second)
+        us_dur_s = float(p['US_train_duration'] / second)
 
-            g_cs = p.get('spikeInputAmplitude_CS', p['spikeInputAmplitude'])
-            g_us = p.get('spikeInputAmplitude_US', p['spikeInputAmplitude'])
-            g_ref = p['conductance_filter_ref']
-            _on_pre_ext = 'x_e_rise_post += g_stim / g_filter_ref; x_e_decay_post += g_stim / g_filter_ref'
-            self._syn_CS = Synapses(
-                self._CS_group, self._unitsExc,
-                on_pre=_on_pre_ext,
-                namespace={'g_stim': g_cs, 'g_filter_ref': g_ref},
-            )
-            self._syn_CS.connect(i=np.arange(nCS), j=cs_neuron_inds)
-            self._syn_US = Synapses(
-                self._US_group, self._unitsExc,
-                on_pre=_on_pre_ext,
-                namespace={'g_stim': g_us, 'g_filter_ref': g_ref},
-            )
-            self._syn_US.connect(i=np.arange(nUS), j=us_neuron_inds)
-        else:
-            self._CS_group = None
-            self._US_group = None
-            self._syn_CS = None
-            self._syn_US = None
+        cs_i, cs_t = jittered_pulse_spike_times(
+            nCS, cs_times_s, trial_starts_s, cs_dur_s, cs_jit, rng
+        )
+        us_i, us_t = jittered_pulse_spike_times(
+            nUS, us_times_s, p['_us_epoch_starts_s'], us_dur_s, us_jit, rng
+        )
+
+        self._CS_group = SpikeGeneratorGroup(nCS, cs_i, cs_t * second)
+        self._US_group = SpikeGeneratorGroup(nUS, us_i, us_t * second)
+        self._syn_CS = Synapses(
+            self._CS_group, self._unitsExc,
+            on_pre=_on_pre_ext,
+            namespace={'g_stim': g_cs, 'g_filter_ref': g_ref},
+        )
+        self._syn_CS.connect(i=np.arange(nCS), j=cs_neuron_inds)
+        self._syn_US = Synapses(
+            self._US_group, self._unitsExc,
+            on_pre=_on_pre_ext,
+            namespace={'g_stim': g_us, 'g_filter_ref': g_ref},
+        )
+        self._syn_US.connect(i=np.arange(nUS), j=us_neuron_inds)
 
         self._NS_perturb_group = None
         self._syn_NS_perturb = None
@@ -925,6 +788,64 @@ class Network:
         self._stateMonExc = StateMonitor(self._unitsExc, 'v', record=record_exc)
         self._stateMonInh = StateMonitor(self._unitsInh, 'v', record=record_inh)
 
+    def _manual_ns_us_learning_enabled(self):
+        return bool(self.params.get('manual_ns_us_trial_learning', False))
+
+    def _apply_manual_ns_us_trial_learning(self, trial_idx):
+        """
+        Trial-end NS->US update:
+        - if NS neuron fired within that trial's US window: NS->US += pot_delta
+        - otherwise: NS->US -= dep_delta
+        """
+        p = self.params
+        if not self._manual_ns_us_learning_enabled():
+            return
+        if 'us_stim_epoch_intervals_s' not in p:
+            return
+
+        trial_starts = np.asarray(p.get('trial_starts_s', []), dtype=float).ravel()
+        if trial_idx < 0 or trial_idx >= trial_starts.size:
+            return
+        trial_start = float(trial_starts[trial_idx])
+        trial_end = trial_start + float(p.get('trial_duration_s', 0.0))
+
+        us_intervals = np.asarray(p.get('us_stim_epoch_intervals_s', np.zeros((0, 2))), dtype=float).reshape(-1, 2)
+        if us_intervals.size == 0:
+            return
+        sel = (us_intervals[:, 0] >= trial_start - 1e-12) & (us_intervals[:, 0] < trial_end + 1e-12)
+        if not np.any(sel):
+            return  # CS-only trial: no US, skip manual update
+        us_t0, us_t1 = us_intervals[np.where(sel)[0][0]]
+
+        n_exc = int(p['nExc'])
+        cs_inds = np.asarray(p['cs_neuron_inds'], dtype=np.int64).ravel()
+        us_inds = np.asarray(p['us_neuron_inds'], dtype=np.int64).ravel()
+        ns_inds = np.setdiff1d(np.arange(n_exc, dtype=np.int64), np.union1d(cs_inds, us_inds))
+        if ns_inds.size == 0 or us_inds.size == 0:
+            return
+
+        t_exc = np.asarray(self._spikeMonExc.t / second, dtype=float)
+        i_exc = np.asarray(self._spikeMonExc.i, dtype=np.int64)
+        in_us = (t_exc >= float(us_t0)) & (t_exc < float(us_t1)) & np.isin(i_exc, ns_inds)
+        fired_ns = np.unique(i_exc[in_us])
+        silent_ns = np.setdiff1d(ns_inds, fired_ns)
+
+        pre = np.asarray(self._synapsesEE.i, dtype=np.int64)
+        post = np.asarray(self._synapsesEE.j, dtype=np.int64)
+        ns_to_us = np.isin(pre, ns_inds) & np.isin(post, us_inds)
+        if not np.any(ns_to_us):
+            return
+
+        pot_delta = p.get('manual_ns_us_trial_pot_delta', 0 * nS)
+        dep_delta = p.get('manual_ns_us_trial_dep_delta', pot_delta)
+        g = np.asarray(self._synapsesEE.gEE / siemens, dtype=np.float64)
+        if fired_ns.size > 0:
+            g[ns_to_us & np.isin(pre, fired_ns)] += float(pot_delta / siemens)
+        if silent_ns.size > 0:
+            g[ns_to_us & np.isin(pre, silent_ns)] -= float(dep_delta / siemens)
+        g = np.clip(g, float(p['g_min_EE'] / siemens), float(p['g_max_EE'] / siemens))
+        self._synapsesEE.gEE = g * siemens
+
     def run(self):
         """Build, run, fill weight_matrix_post and optional checkpoint. Returns monitors tuple."""
         self._derive_population_sizes()
@@ -1005,30 +926,54 @@ class Network:
             self._w_stats_w_in.append(wi)
             self._w_stats_w_out.append(wo)
 
-        if self._w_stats_chunked_run:
-            total_s = float(p['duration'] / second)
-            rd_s = float(record_w_dt / second)
+        manual_trial_learning = self._manual_ns_us_learning_enabled()
+        total_s = float(p['duration'] / second)
+        if self._w_stats_chunked_run or manual_trial_learning:
             dt_s = float(defaultclock.dt / second)
-            _snap_ee_w_stats()
-            rem_s = total_s
-            while rem_s > 1e-15:
-                step_s = min(rd_s, rem_s)
-                step = step_s * second
-                rep_type = p['reportType']
-                rep_per = p['reportPeriod']
-                if rep_type == 'text':
-                    rep_per = min(rep_per, step)
-                    if float(rep_per / second) < dt_s:
-                        rep_per = defaultclock.dt
-                is_final_segment = abs(step_s - rem_s) <= 1e-12
-                b2_net.run(
-                    step,
-                    report=rep_type,
-                    report_period=rep_per,
-                    profile=p['doProfile'] and is_final_segment,
-                )
-                rem_s -= step_s
+            checkpoints = [total_s]
+            w_checkpoints = np.array([], dtype=float)
+            if self._w_stats_chunked_run:
+                rd_s = float(record_w_dt / second)
+                w_checkpoints = np.arange(rd_s, total_s + 1e-12, rd_s, dtype=float)
+                checkpoints.extend(w_checkpoints.tolist())
                 _snap_ee_w_stats()
+            trial_end_s = np.array([], dtype=float)
+            if manual_trial_learning:
+                trial_end_s = np.asarray(p['trial_starts_s'], dtype=float).ravel() + float(p['trial_duration_s'])
+                checkpoints.extend(trial_end_s.tolist())
+            checkpoints = sorted({float(c) for c in checkpoints if 0.0 < float(c) <= total_s + 1e-12})
+
+            t_prev = 0.0
+            next_trial = 0
+            next_w = 0
+            for t_now in checkpoints:
+                step_s = max(0.0, t_now - t_prev)
+                if step_s > 0:
+                    step = step_s * second
+                    rep_type = p['reportType']
+                    rep_per = p['reportPeriod']
+                    if rep_type == 'text':
+                        rep_per = min(rep_per, step)
+                        if float(rep_per / second) < dt_s:
+                            rep_per = defaultclock.dt
+                    is_final_segment = abs(t_now - total_s) <= 1e-12
+                    b2_net.run(
+                        step,
+                        report=rep_type,
+                        report_period=rep_per,
+                        profile=p['doProfile'] and is_final_segment,
+                    )
+                t_prev = t_now
+
+                if manual_trial_learning and trial_end_s.size > 0:
+                    while next_trial < trial_end_s.size and trial_end_s[next_trial] <= t_now + 1e-12:
+                        self._apply_manual_ns_us_trial_learning(next_trial)
+                        next_trial += 1
+
+                if self._w_stats_chunked_run and w_checkpoints.size > 0:
+                    while next_w < w_checkpoints.size and w_checkpoints[next_w] <= t_now + 1e-12:
+                        _snap_ee_w_stats()
+                        next_w += 1
         else:
             b2_net.run(p['duration'], report=p['reportType'], report_period=p['reportPeriod'], profile=p['doProfile'])
 
