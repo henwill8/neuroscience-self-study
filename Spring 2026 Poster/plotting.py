@@ -79,7 +79,7 @@ def draw_cs_us_stimulus_pulse_lines(ax, p, zorder=2, legend_label=True):
     """
     Vertical line at each nominal CS/US input pulse time (cs_stim_pulse_times_s, us_stim_pulse_times_s).
     Actual SpikeGenerator times are jittered per neuron when CS_input_jitter_std / US_input_jitter_std > 0
-    (upper-clipped to train end only, not to train onset).
+    (clamped to [0, epoch_start + train_duration]).
     """
     labeled_cs = False
     labeled_us = False
@@ -389,60 +389,274 @@ def compute_mean_firing_rates(results):
 
 def compute_ns_trial_trajectories(results, bin_size=5*ms, n_components=3):
     """
-    Project each trial's NS (non-stimulated) population activity into a shared PCA space
-    for comparing trial-to-trial trajectory similarity.
+    Bin NS (non-stimulated) excitatory firing over the entire simulation, fit PCA on all bins,
+    and return one trajectory in PC space (not reset per trial).
 
-    Requires params: trial_starts_s, trial_duration_s, trial_conditions, cs_neuron_inds, us_neuron_inds.
+    Requires params: duration (or results.duration), cs_neuron_inds, us_neuron_inds, nExc.
 
     Returns
     -------
-    projected_trials : ndarray, shape (n_trials, n_timepoints, n_components)
-        Each trial's NS trajectory in PCA space.
+    projected : ndarray, shape (n_timepoints, n_components)
+        NS population trajectory in PCA space for the full run.
     time_s : ndarray, shape (n_timepoints,)
-        Time within trial (s) for each bin.
-    conditions : ndarray, shape (n_trials,)
-        Condition label per trial ('CS' or 'US').
+        Simulation time (s) at bin centers.
+    conditions : None
+        Reserved; per-trial conditions are not used for full-run PCA.
     pca : sklearn PCA
-        Fitted PCA on (n_trials * n_timepoints, n_ns_neurons) NS data.
+        Fitted on (n_timepoints, n_ns_neurons) NS binned rates.
     ns_inds : ndarray
         Indices of NS neurons.
-    or (None, None, None, None, None) if trial/CS/US info missing or no NS neurons.
+    or (None, None, None, None, None) if CS/US info missing, no NS neurons, or too few bins.
     """
     p = results.p
-    if 'trial_starts_s' not in p or 'trial_duration_s' not in p or 'trial_conditions' not in p:
-        return None, None, None, None, None
     if 'cs_neuron_inds' not in p or 'us_neuron_inds' not in p:
         return None, None, None, None, None
     cs_set = set(np.atleast_1d(p['cs_neuron_inds']))
     us_set = set(np.atleast_1d(p['us_neuron_inds']))
-    n_exc = p['nExc']
+    n_exc = int(p['nExc'])
     ns_inds = np.array([i for i in range(n_exc) if i not in cs_set and i not in us_set])
     if len(ns_inds) == 0:
         return None, None, None, None, None
 
-    data, conditions = compute_trial_binned_data(results, bin_size=bin_size, use_exc_only=True)
-    if data is None or data.size == 0:
+    T = float(getattr(results, 'duration', float(p['duration'] / second)))
+    bin_size_s = float(bin_size / second)
+    if T <= 0 or bin_size_s <= 0:
         return None, None, None, None, None
-    # data: (n_trials, n_timepoints, n_neurons); restrict to NS
-    ns_data = data[:, :, ns_inds]  # (n_trials, n_timepoints, n_ns)
-    n_trials, n_timepoints, n_ns = ns_data.shape
+    n_timepoints = int(round(T / bin_size_s))
+    if n_timepoints < 1:
+        return None, None, None, None, None
+    bins = np.linspace(0.0, T, n_timepoints + 1)
+    n_ns = len(ns_inds)
+    ns_data = np.zeros((n_timepoints, n_ns))
+    for j, i in enumerate(ns_inds):
+        spikes = results.spikeMonExcT[results.spikeMonExcI == i]
+        counts, _ = np.histogram(spikes, bins)
+        ns_data[:, j] = counts / bin_size_s
 
-    # Fit PCA on all NS activity (all trials, all timepoints)
-    X_all = ns_data.reshape(-1, n_ns)
-    n_components = min(n_components, n_ns, X_all.shape[0] - 1)
+    n_components = min(int(n_components), n_ns, n_timepoints - 1)
     if n_components < 1:
         return None, None, None, None, None
     pca = PCA(n_components=n_components)
-    pca.fit(X_all)
+    pca.fit(ns_data)
+    projected = pca.transform(ns_data)
+    time_s = (bins[:-1] + bins[1:]) / 2.0
+    return projected, time_s, None, pca, ns_inds
 
-    # Project each trial
-    projected_trials = np.zeros((n_trials, n_timepoints, n_components))
-    for tr in range(n_trials):
-        projected_trials[tr] = pca.transform(ns_data[tr])
+
+def _binary_auc_from_scores(y_true, scores):
+    """
+    ROC-AUC for binary labels {0,1} using rank statistic.
+    Returns np.nan when undefined (single class or empty).
+    """
+    y_true = np.asarray(y_true, dtype=np.int64).ravel()
+    scores = np.asarray(scores, dtype=float).ravel()
+    if y_true.size == 0 or scores.size != y_true.size:
+        return np.nan
+    n_pos = int(np.sum(y_true == 1))
+    n_neg = int(np.sum(y_true == 0))
+    if n_pos == 0 or n_neg == 0:
+        return np.nan
+    order = np.argsort(scores)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(1, len(scores) + 1, dtype=float)
+    sum_pos = float(np.sum(ranks[y_true == 1]))
+    u = sum_pos - n_pos * (n_pos + 1) / 2.0
+    return u / (n_pos * n_neg)
+
+
+def compute_ns_time_resolved_decodability(results, bin_size=10*ms, n_splits=5):
+    """
+    Time-resolved NS decodability between CS and US trials using a nearest-centroid decoder.
+    Returns (time_s, accuracy), or (None, None) if trial labels/NS group are unavailable.
+    """
+    p = results.p
+    if 'cs_neuron_inds' not in p or 'us_neuron_inds' not in p:
+        return None, None
+    data, conditions = compute_trial_binned_data(results, bin_size=bin_size, use_exc_only=True)
+    if data is None or conditions is None or data.size == 0:
+        return None, None
+    cond = np.asarray(conditions)
+    mask = (cond == 'CS') | (cond == 'US')
+    if np.sum(mask) < 4:
+        return None, None
+    data = data[mask]
+    cond = cond[mask]
+    y = (cond == 'US').astype(np.int64)
+
+    cs_set = set(np.atleast_1d(p['cs_neuron_inds']))
+    us_set = set(np.atleast_1d(p['us_neuron_inds']))
+    n_exc = int(p['nExc'])
+    ns_inds = np.array([i for i in range(n_exc) if i not in cs_set and i not in us_set], dtype=np.int64)
+    if ns_inds.size == 0:
+        return None, None
+    ns_data = data[:, :, ns_inds]  # (n_trials, n_timepoints, n_ns)
+    n_trials, n_timepoints, _ = ns_data.shape
+    idx0 = np.where(y == 0)[0]
+    idx1 = np.where(y == 1)[0]
+    n_folds = int(min(max(2, n_splits), len(idx0), len(idx1)))
+    if n_folds < 2:
+        return None, None
+
+    rng = np.random.default_rng(0)
+    idx0 = idx0[rng.permutation(len(idx0))]
+    idx1 = idx1[rng.permutation(len(idx1))]
+    folds0 = np.array_split(idx0, n_folds)
+    folds1 = np.array_split(idx1, n_folds)
+
+    acc = np.full(n_timepoints, np.nan, dtype=float)
+    for t in range(n_timepoints):
+        Xt = ns_data[:, t, :]
+        fold_scores = []
+        for k in range(n_folds):
+            test_idx = np.concatenate([folds0[k], folds1[k]])
+            train_mask = np.ones(n_trials, dtype=bool)
+            train_mask[test_idx] = False
+            train_idx = np.where(train_mask)[0]
+            if train_idx.size < 2 or np.sum(y[train_idx] == 0) == 0 or np.sum(y[train_idx] == 1) == 0:
+                continue
+            c0 = Xt[train_idx][y[train_idx] == 0].mean(axis=0)
+            c1 = Xt[train_idx][y[train_idx] == 1].mean(axis=0)
+            d0 = np.sum((Xt[test_idx] - c0) ** 2, axis=1)
+            d1 = np.sum((Xt[test_idx] - c1) ** 2, axis=1)
+            y_hat = (d1 < d0).astype(np.int64)
+            fold_scores.append(np.mean(y_hat == y[test_idx]))
+        if len(fold_scores) > 0:
+            acc[t] = float(np.mean(fold_scores))
 
     bin_size_s = float(bin_size / second)
     time_s = (np.arange(n_timepoints) + 0.5) * bin_size_s
-    return projected_trials, time_s, conditions, pca, ns_inds
+    return time_s, acc
+
+
+def compute_reservoir_memory_curve(results, bin_size=10*ms, max_lag_bins=40):
+    """
+    Memory proxy: how well current NS state predicts CS pulse count from k bins in the past.
+    Returns (lags_s, r2_by_lag), or (None, None) if required signals are unavailable.
+    """
+    p = results.p
+    if 'cs_neuron_inds' not in p or 'us_neuron_inds' not in p:
+        return None, None
+    cs_set = set(np.atleast_1d(p['cs_neuron_inds']))
+    us_set = set(np.atleast_1d(p['us_neuron_inds']))
+    n_exc = int(p['nExc'])
+    ns_inds = np.array([i for i in range(n_exc) if i not in cs_set and i not in us_set], dtype=np.int64)
+    if ns_inds.size == 0:
+        return None, None
+
+    bin_size_s = float(bin_size / second)
+    T = float(getattr(results, 'duration', float(p['duration'] / second)))
+    if T <= 0.0 or bin_size_s <= 0.0:
+        return None, None
+    n_bins = int(round(T / bin_size_s))
+    if n_bins < 10:
+        return None, None
+    bins = np.linspace(0.0, T, n_bins + 1)
+
+    X = np.zeros((n_bins, ns_inds.size), dtype=float)
+    for j, i in enumerate(ns_inds):
+        spikes = results.spikeMonExcT[results.spikeMonExcI == i]
+        counts, _ = np.histogram(spikes, bins)
+        X[:, j] = counts / bin_size_s
+    X = X - X.mean(axis=0, keepdims=True)
+
+    cs_pulses = np.asarray(p.get('cs_stim_pulse_times_s', []), dtype=float)
+    if cs_pulses.size == 0:
+        return None, None
+    u, _ = np.histogram(cs_pulses, bins)
+    u = u.astype(float)
+
+    max_lag = int(min(max_lag_bins, n_bins // 2))
+    if max_lag < 1:
+        return None, None
+    lags = np.arange(1, max_lag + 1, dtype=int)
+    r2 = np.full(lags.size, np.nan, dtype=float)
+
+    ridge = 1e-3
+    for ii, lag in enumerate(lags):
+        X_lag = X[lag:, :]
+        y_lag = u[:-lag]
+        n = X_lag.shape[0]
+        n_train = int(np.floor(0.7 * n))
+        if n_train < 5 or (n - n_train) < 3:
+            continue
+        Xtr, Xte = X_lag[:n_train], X_lag[n_train:]
+        ytr, yte = y_lag[:n_train], y_lag[n_train:]
+
+        Xtr_aug = np.hstack([Xtr, np.ones((Xtr.shape[0], 1))])
+        Xte_aug = np.hstack([Xte, np.ones((Xte.shape[0], 1))])
+        I = np.eye(Xtr_aug.shape[1], dtype=float)
+        I[-1, -1] = 0.0  # do not regularize bias
+        w = np.linalg.solve(Xtr_aug.T @ Xtr_aug + ridge * I, Xtr_aug.T @ ytr)
+        yhat = Xte_aug @ w
+        ss_res = np.sum((yte - yhat) ** 2)
+        ss_tot = np.sum((yte - np.mean(yte)) ** 2)
+        if ss_tot > 0:
+            r2[ii] = 1.0 - ss_res / ss_tot
+
+    return lags * bin_size_s, r2
+
+
+def compute_us_readout_metrics(results):
+    """
+    Trial-level US readout metrics from US-neuron firing in the scheduled US train window.
+    Returns dict or None if trial/US metadata is unavailable.
+    """
+    p = results.p
+    needed = ('trial_starts_s', 'trial_conditions', 'us_neuron_inds', 'ISI', 'US_train_duration')
+    if any(k not in p for k in needed):
+        return None
+    us_inds = np.atleast_1d(p['us_neuron_inds']).astype(np.int64)
+    if us_inds.size == 0:
+        return None
+    trial_starts = np.asarray(p['trial_starts_s'], dtype=float)
+    conditions = np.asarray(p['trial_conditions'])
+    if trial_starts.size == 0 or conditions.size != trial_starts.size:
+        return None
+
+    us_start_offset = float(p['ISI'] / second)
+    us_end_offset = us_start_offset + float(p['US_train_duration'] / second)
+    if us_end_offset <= us_start_offset:
+        return None
+    window_s = us_end_offset - us_start_offset
+
+    t_exc = np.asarray(results.spikeMonExcT, dtype=float)
+    i_exc = np.asarray(results.spikeMonExcI, dtype=np.int64)
+    in_us_group = np.isin(i_exc, us_inds)
+    t_us_group = t_exc[in_us_group]
+
+    rates = np.zeros(trial_starts.size, dtype=float)
+    for tr, t0 in enumerate(trial_starts):
+        a = t0 + us_start_offset
+        b = t0 + us_end_offset
+        n_spk = np.sum((t_us_group >= a) & (t_us_group < b))
+        rates[tr] = n_spk / (us_inds.size * window_s)
+
+    valid = (conditions == 'CS') | (conditions == 'US')
+    if np.sum(valid) < 2:
+        return None
+    y = (conditions[valid] == 'US').astype(np.int64)
+    s = rates[valid]
+    if np.sum(y == 1) == 0 or np.sum(y == 0) == 0:
+        return None
+
+    m1 = float(np.mean(s[y == 1]))
+    m0 = float(np.mean(s[y == 0]))
+    v1 = float(np.var(s[y == 1]))
+    v0 = float(np.var(s[y == 0]))
+    dprime = (m1 - m0) / np.sqrt(0.5 * (v1 + v0) + 1e-12)
+    threshold = 0.5 * (m1 + m0)
+    acc = float(np.mean((s >= threshold).astype(np.int64) == y))
+    auc = float(_binary_auc_from_scores(y, s))
+
+    return {
+        'trial_conditions': conditions,
+        'trial_rates_Hz': rates,
+        'valid_mask': valid,
+        'auc': auc,
+        'dprime': float(dprime),
+        'threshold_acc': acc,
+        'us_window_s': (us_start_offset, us_end_offset),
+    }
 
 
 def compute_block_weight_change(W_pre, W_post, groups, group_names=None):
@@ -876,9 +1090,8 @@ class SimpleResults:
     def plot_ns_trial_trajectories(self, bin_size=5*ms, n_components=3, ax_2d=None, ax_3d=None,
                                    color_by_time=True, cmap='viridis', alpha=0.75, linewidth=1.2):
         """
-        Plot each trial's NS population trajectory in PCA space to compare trial-to-trial similarity.
-        Trajectories are overlaid; color indicates time within trial (early→late) so direction is visible.
-        Similar trials will overlap; different trials will diverge.
+        Plot the NS population trajectory in PCA space for the full simulation (one continuous path).
+        Color indicates simulation time (early→late) when color_by_time is True.
 
         Parameters
         ----------
@@ -889,7 +1102,7 @@ class SimpleResults:
         ax_2d, ax_3d : matplotlib axes, optional
             If provided, draw in these axes (ax_2d = PC1 vs PC2, ax_3d = 3D). If both None, create a figure with 2 panels.
         color_by_time : bool
-            If True, color trajectory by time within trial; else use a single color per trial.
+            If True, color by simulation time; else use a single color.
         cmap : str
             Colormap name for time (e.g. 'viridis', 'plasma').
         alpha, linewidth : float
@@ -901,10 +1114,10 @@ class SimpleResults:
             The figure if one was created, else None.
         """
         out = compute_ns_trial_trajectories(self, bin_size=bin_size, n_components=max(n_components, 2))
-        projected_trials, time_s, conditions, pca, ns_inds = out
-        if projected_trials is None or pca is None:
+        projected, time_s, _conditions, pca, ns_inds = out
+        if projected is None or pca is None:
             return None
-        n_trials, n_timepoints, nc = projected_trials.shape
+        n_timepoints, nc = projected.shape
         if nc < 2:
             return None
 
@@ -924,38 +1137,111 @@ class SimpleResults:
         norm = Normalize(vmin=time_s.min(), vmax=time_s.max())
         cmap_obj = plt.get_cmap(cmap)
 
-        for tr in range(n_trials):
-            proj = projected_trials[tr]  # (n_timepoints, n_components)
+        for t in range(n_timepoints - 1):
+            c = cmap_obj(norm((time_s[t] + time_s[t + 1]) / 2)) if color_by_time else '0.5'
+            ax_2d.plot(projected[t:t + 2, 0], projected[t:t + 2, 1], color=c, alpha=alpha, lw=linewidth)
+        if ax_3d is not None and nc >= 3:
             for t in range(n_timepoints - 1):
                 c = cmap_obj(norm((time_s[t] + time_s[t + 1]) / 2)) if color_by_time else '0.5'
-                ax_2d.plot(proj[t:t + 2, 0], proj[t:t + 2, 1], color=c, alpha=alpha, lw=linewidth)
-            if ax_3d is not None and nc >= 3:
-                for t in range(n_timepoints - 1):
-                    c = cmap_obj(norm((time_s[t] + time_s[t + 1]) / 2)) if color_by_time else '0.5'
-                    ax_3d.plot(proj[t:t + 2, 0], proj[t:t + 2, 1], proj[t:t + 2, 2], color=c, alpha=alpha, lw=linewidth)
+                ax_3d.plot(
+                    projected[t:t + 2, 0],
+                    projected[t:t + 2, 1],
+                    projected[t:t + 2, 2],
+                    color=c,
+                    alpha=alpha,
+                    lw=linewidth,
+                )
 
         ax_2d.set_xlabel("PC1 (NS)")
         ax_2d.set_ylabel("PC2 (NS)")
-        ax_2d.set_title("NS population trajectory (each line = one trial)")
+        ax_2d.set_title("NS population trajectory (full simulation)")
         ax_2d.set_aspect('equal', adjustable='datalim')
         ax_2d.axhline(0, color='k', lw=0.3, alpha=0.5)
         ax_2d.axvline(0, color='k', lw=0.3, alpha=0.5)
         if color_by_time:
             sm = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
             sm.set_array([])
-            plt.colorbar(sm, ax=ax_2d, shrink=0.7, label="Time in trial (s)")
+            plt.colorbar(sm, ax=ax_2d, shrink=0.7, label="Time (s)")
 
         if ax_3d is not None and nc >= 3:
             ax_3d.set_xlabel("PC1 (NS)")
             ax_3d.set_ylabel("PC2 (NS)")
             ax_3d.set_zlabel("PC3 (NS)")
-            ax_3d.set_title("NS trajectory 3D (each line = one trial)")
+            ax_3d.set_title("NS trajectory 3D (full simulation)")
             if color_by_time:
-                plt.colorbar(sm, ax=ax_3d, shrink=0.6, label="Time in trial (s)")
+                plt.colorbar(sm, ax=ax_3d, shrink=0.6, label="Time (s)")
 
         if create_fig and fig_out is not None:
             fig_out.tight_layout()
         return fig_out
+
+    def plot_readout_evaluations(self, bin_size=10*ms, max_lag_bins=40, axes=None):
+        """
+        Evaluation panel for reservoir/readout goals:
+          1) Time-resolved NS decodability (CS vs US trials),
+          2) Reservoir memory curve (lagged CS pulse reconstruction R^2),
+          3) Trial-level US readout score with AUC / d'.
+        Returns the created figure, or None if custom axes were provided.
+        """
+        created_fig = None
+        if axes is None:
+            created_fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        ax_dec, ax_mem, ax_us = axes
+
+        t_dec, acc = compute_ns_time_resolved_decodability(self, bin_size=bin_size, n_splits=5)
+        if t_dec is None or acc is None:
+            ax_dec.text(0.5, 0.5, "NS decodability unavailable", ha='center', va='center', transform=ax_dec.transAxes)
+            ax_dec.set_xticks([])
+            ax_dec.set_yticks([])
+        else:
+            ax_dec.plot(t_dec, acc, color='C2', lw=1.6)
+            ax_dec.axhline(0.5, color='k', lw=0.8, ls='--', alpha=0.7)
+            ax_dec.set_ylim(0.0, 1.0)
+            ax_dec.set_xlabel("Time within trial (s)")
+            ax_dec.set_ylabel("CV accuracy")
+            ax_dec.set_title("NS decodability (CS vs US)")
+
+        lags_s, r2 = compute_reservoir_memory_curve(self, bin_size=bin_size, max_lag_bins=max_lag_bins)
+        if lags_s is None or r2 is None:
+            ax_mem.text(0.5, 0.5, "Memory curve unavailable", ha='center', va='center', transform=ax_mem.transAxes)
+            ax_mem.set_xticks([])
+            ax_mem.set_yticks([])
+        else:
+            ax_mem.plot(lags_s, r2, color='C1', marker='o', ms=3, lw=1.2)
+            ax_mem.axhline(0.0, color='k', lw=0.8, ls='--', alpha=0.7)
+            ax_mem.set_xlabel("Lag (s)")
+            ax_mem.set_ylabel(r"$R^2$")
+            ax_mem.set_title("Reservoir memory curve")
+
+        m = compute_us_readout_metrics(self)
+        if m is None:
+            ax_us.text(0.5, 0.5, "US readout metrics unavailable", ha='center', va='center', transform=ax_us.transAxes)
+            ax_us.set_xticks([])
+            ax_us.set_yticks([])
+        else:
+            cond = np.asarray(m['trial_conditions'])
+            rates = np.asarray(m['trial_rates_Hz'], dtype=float)
+            x = np.arange(rates.size)
+            color = np.where(cond == 'US', 'C0', np.where(cond == 'CS', 'C3', '0.6'))
+            ax_us.scatter(x, rates, c=color, s=20, alpha=0.85)
+            w0, w1 = m['us_window_s']
+            ax_us.set_xlabel("Trial")
+            ax_us.set_ylabel("US-pop firing rate (Hz)")
+            ax_us.set_title(
+                "US readout: AUC={:.3f}, d'={:.3f}, acc={:.3f}\nWindow [{:.3f}, {:.3f}] s".format(
+                    m['auc'], m['dprime'], m['threshold_acc'], w0, w1
+                )
+            )
+            us_mask = (cond == 'US')
+            cs_mask = (cond == 'CS')
+            if np.any(us_mask):
+                ax_us.axhline(np.mean(rates[us_mask]), color='C0', lw=1.0, ls='--', alpha=0.7)
+            if np.any(cs_mask):
+                ax_us.axhline(np.mean(rates[cs_mask]), color='C3', lw=1.0, ls='--', alpha=0.7)
+
+        if created_fig is not None:
+            created_fig.tight_layout()
+        return created_fig
 
     def plot_ee_w_in_w_out(self, figsize=(8, 6)):
         """
@@ -1040,9 +1326,10 @@ class SimpleResults:
 def plot_all_figures(results, show=True):
     """
     Create the standard poster figures from a SimpleResults instance.
-    Returns (fig1, fig2, fig3, fig4, fig5, fig6). If show is True, calls plt.show() at the end.
-    fig5: NS population trial trajectories (per-trial PCA trajectory overlay).
+    Returns (fig1, fig2, fig3, fig4, fig5, fig6, fig7). If show is True, calls plt.show() at the end.
+    fig5: NS population PCA trajectory over the full simulation time.
     fig6: W_in / W_out time series for CS, US, NS (None if not recorded).
+    fig7: Reservoir/readout evaluation panel (decodability, memory, US readout score).
     """
     # Figure 1: raster, firing rate, voltage
     fig1 = plt.figure(figsize=(8, 10))
@@ -1055,14 +1342,15 @@ def plot_all_figures(results, show=True):
     fig1.tight_layout()
 
     # Figure 2: PCA 3D, within/between correlation, PCA variance
+    pca_bin_size = 10 * ms
     fig2 = plt.figure(figsize=(10, 12))
     gs = fig2.add_gridspec(3, 1, height_ratios=[2, 1, 1])
     ax_pca = fig2.add_subplot(gs[0], projection='3d')
     ax_corr = fig2.add_subplot(gs[1])
     ax_var = fig2.add_subplot(gs[2])
-    results.plot_pca_3d_time_color(ax=ax_pca)
+    results.plot_pca_3d_time_color(ax=ax_pca, bin_size=pca_bin_size)
     results.plot_within_between_correlations(ax=ax_corr)
-    results.plot_pca_variance(ax=ax_var)
+    results.plot_pca_variance(ax=ax_var, bin_size=pca_bin_size)
     fig2.tight_layout()
 
     # Figure 3: weight change by block
@@ -1071,7 +1359,7 @@ def plot_all_figures(results, show=True):
         fig3.tight_layout()
 
     # Figure 4: PCA centroid trajectories
-    fig4 = results.plot_pca_centroid_trajectories(bin_size=10*ms, n_components=3)
+    fig4 = results.plot_pca_centroid_trajectories(bin_size=pca_bin_size, n_components=3)
     if fig4 is not None:
         fig4.tight_layout()
 
@@ -1083,7 +1371,9 @@ def plot_all_figures(results, show=True):
     # Figure 6: L&D-style W_in / W_out for CS, US, NS
     fig6 = results.plot_ee_w_in_w_out()
 
+    fig7 = results.plot_readout_evaluations(bin_size=10*ms, max_lag_bins=40)
+
     if show:
         plt.show()
-    return fig1, fig2, fig3, fig4, fig5, fig6
+    return fig1, fig2, fig3, fig4, fig5, fig6, fig7
 

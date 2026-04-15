@@ -31,13 +31,10 @@ def jittered_pulse_spike_times(n_sources, pulse_times_s, epoch_starts_s, train_d
     Indices and spike times (seconds) for a SpikeGeneratorGroup of size n_sources.
 
     Each source receives every nominal pulse in pulse_times_s, with independent Gaussian jitter.
-    Times are only upper-clipped to epoch_start + train_duration_s (per pulse's epoch); there is
-    no lower clip at epoch_start, so negative jitter can move pulses earlier (e.g. the first
-    pulse of a train is not forced synchronous at the boundary). If jitter_std_s <= 0, all sources
-    share the nominal times (synchronized drive).
-
-    Ensure pre_first_trial_delay (and US timing) leave enough margin if your simulator requires
-    spike times >= 0.
+    Times are clamped to [0, epoch_start + train_duration_s] using each pulse's epoch start.
+    Lower clamping is global at t=0 (not epoch_start) so the first pulse in a train can still
+    move earlier than its nominal epoch boundary without ever becoming negative. If jitter_std_s
+    <= 0, all sources share the nominal times (synchronized drive).
 
     Returned arrays are sorted by time for Brian2.
     """
@@ -47,12 +44,20 @@ def jittered_pulse_spike_times(n_sources, pulse_times_s, epoch_starts_s, train_d
     if n_p == 0 or int(n_sources) <= 0:
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
     jit = float(jitter_std_s)
+    # Map each pulse to its epoch end so jitter cannot move spikes beyond the train duration.
+    if epoch_starts_s.size > 0:
+        epoch_pos = np.searchsorted(epoch_starts_s, pulse_times_s, side='right') - 1
+        epoch_pos = np.clip(epoch_pos, 0, epoch_starts_s.size - 1)
+        pulse_upper = epoch_starts_s[epoch_pos] + float(train_duration_s)
+    else:
+        pulse_upper = np.full(n_p, np.inf, dtype=np.float64)
     if jit <= 0.0:
         idx = np.repeat(np.arange(n_sources, dtype=np.int64), n_p)
         t = np.tile(pulse_times_s, n_sources)
     else:
         noise = rng.normal(0.0, jit, size=(int(n_sources), n_p))
         t_mat = pulse_times_s + noise
+        t_mat = np.minimum(np.maximum(t_mat, 0.0), pulse_upper[None, :])
         idx = np.repeat(np.arange(n_sources, dtype=np.int64), n_p)
         t = t_mat.ravel(order='C')
     order = np.argsort(t, kind='mergesort')

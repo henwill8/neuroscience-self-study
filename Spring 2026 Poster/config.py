@@ -48,9 +48,9 @@ def get_default_params():
         # Feedforward CS/US: SpikeGenerator → E synapses at CS_Hz / US_Hz (see network._build_cs_us_input).
         'spikeInputAmplitude_CS': 200 * nS,
         'spikeInputAmplitude_US': 200 * nS,
-        # Per-neuron Gaussian jitter (s) on each input spike time. Upper-clipped to train end only
-        # (no floor at train onset) so the first pulse can fire earlier and stay desynchronized.
-        # 0 = synchronized pulses across the group. Use enough pre_first_trial_delay if times must stay >= 0.
+        # Per-neuron Gaussian jitter (s) on each input spike time. Jittered times are clamped
+        # to [0, epoch_start + train_duration], so spikes never go negative and never exceed train end.
+        # 0 = synchronized pulses across the group.
         'CS_input_jitter_std': 5 * ms,
         'US_input_jitter_std': 5 * ms,
 
@@ -101,7 +101,7 @@ def get_default_params():
         'conductance_filter_ref': 1 * nS,
         # ge_syn = (xd-xr)/tau_ms_diff * conductance_ge_scale. ~50–52*nS with full Julia weights hits a sharp
         # transition to ~kHz runaway; ~12*nS is subcritical — use spikeInputAmplitude to restore driven firing.
-        'conductance_ge_scale': 11 * nS,
+        'conductance_ge_scale': 12 * nS,
 
         'stdp_blocks': None,
         'tauu_vstdp': 10 * ms,
