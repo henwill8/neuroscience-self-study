@@ -28,6 +28,9 @@ def get_default_params():
         'reportType': 'stdout',
         'reportPeriod': 10 * second,
         'doProfile': True,
+        # Brian2: 'auto' uses brian2cuda + GPU when import and nvidia-smi succeed; 'cpu' forces runtime;
+        # 'cuda' requires GPU (Linux + CUDA toolkit recommended).
+        'brian_device': 'auto',
 
         'nTrials': 1,
         'ISI': 360 * ms,

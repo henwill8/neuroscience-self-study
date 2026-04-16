@@ -1,0 +1,4 @@
+# Brian2CUDA: use a dedicated venv; this package pins a compatible Brian2.
+# Requires Linux (officially), NVIDIA GPU (CC ≥ 3.5), and CUDA Toolkit with nvcc.
+# https://brian2cuda.readthedocs.io/en/latest/introduction/install.html
+brian2cuda

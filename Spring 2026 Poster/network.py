@@ -8,6 +8,7 @@ from brian2 import *
 from brian2.core.network import Network as B2Network
 import numpy as np
 
+from brian_backend import configure_brian_backend, effective_profile
 from config import get_default_params
 from plotting import SimpleResults, plot_all_figures
 from utils import (
@@ -152,7 +153,6 @@ class Network:
     def __init__(self, params, rng):
         self.params = params
         self.rng = rng
-        defaultclock.dt = params['dt']
         self.n_trials_total = params['nTrials'] + (1 if params.get('include_CS_only_trial', False) else 0)
 
         self._unitsExc = None
@@ -848,12 +848,16 @@ class Network:
 
     def run(self):
         """Build, run, fill weight_matrix_post and optional checkpoint. Returns monitors tuple."""
+        configure_brian_backend(self.params)
+        defaultclock.dt = self.params['dt']
+
         self._derive_population_sizes()
         self._prepare_cs_us_schedule()
         self._build_neurons()
         self._build_cs_us_input()
 
         p = self.params
+        use_profile = effective_profile(p)
         load_path = p.get('load_checkpoint_path')
         if load_path:
             w_post, ckpt_nExc, ckpt_nInh = load_weights_checkpoint(load_path)
@@ -961,7 +965,7 @@ class Network:
                         step,
                         report=rep_type,
                         report_period=rep_per,
-                        profile=p['doProfile'] and is_final_segment,
+                        profile=use_profile and is_final_segment,
                     )
                 t_prev = t_now
 
@@ -975,7 +979,12 @@ class Network:
                         _snap_ee_w_stats()
                         next_w += 1
         else:
-            b2_net.run(p['duration'], report=p['reportType'], report_period=p['reportPeriod'], profile=p['doProfile'])
+            b2_net.run(
+                p['duration'],
+                report=p['reportType'],
+                report_period=p['reportPeriod'],
+                profile=use_profile,
+            )
 
         if getattr(self, '_w_stats_t_list', None) is not None and len(self._w_stats_t_list) > 0:
             p['w_stats_t'] = np.asarray(self._w_stats_t_list, dtype=np.float64)

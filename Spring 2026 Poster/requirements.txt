@@ -3,3 +3,5 @@ matplotlib
 numpy
 scikit-learn
 scipy
+
+# Optional GPU backend (Linux + CUDA recommended): pip install -r requirements-cuda.txt
