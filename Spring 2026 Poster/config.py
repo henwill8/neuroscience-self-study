@@ -28,11 +28,12 @@ def get_default_params():
         'reportType': 'stdout',
         'reportPeriod': 10 * second,
         'doProfile': True,
-        # Brian2: 'auto' uses brian2cuda + GPU when import and nvidia-smi succeed; 'cpu' forces runtime;
-        # 'cuda' requires GPU (Linux + CUDA toolkit recommended).
+        # Brian2: 'auto' tries brian2cuda + GPU first, then cpp_standalone, then runtime.
+        # EE weight time series on standalone use a Synapses StateMonitor (single long run).
+        # 'cpu' forces runtime; 'cuda' requires GPU (Linux + CUDA toolkit recommended).
         'brian_device': 'auto',
 
-        'nTrials': 1,
+        'nTrials': 30,
         'ISI': 360 * ms,
         'propCS': 0.05,
         'propUS': 0.05,
@@ -40,7 +41,7 @@ def get_default_params():
         # Baseline / setup time before trial 0 CS onset (added to total simulation duration).
         'pre_first_trial_delay': 10 * ms,
         'include_CS_only_trial': True,
-        'cs_only_every_n_trials': None,
+        'cs_only_every_n_trials': 5,
         'CS_train_duration': 440 * ms,
         'CS_Hz': 25 * Hz,
         'US_train_duration': 80 * ms,
@@ -49,17 +50,17 @@ def get_default_params():
         # larger nS/step when conductance_ge_scale is subcritical — tune with conductance_ge_scale).
         'spikeInputAmplitude': 8 * nS,
         # Feedforward CS/US: SpikeGenerator → E synapses at CS_Hz / US_Hz (see network._build_cs_us_input).
-        'spikeInputAmplitude_CS': 200 * nS,
-        'spikeInputAmplitude_US': 200 * nS,
+        'spikeInputAmplitude_CS': 100 * nS,
+        'spikeInputAmplitude_US': 100 * nS,
         # Per-neuron Gaussian jitter (s) on each input spike time. Jittered times are clamped
         # to [0, epoch_start + train_duration], so spikes never go negative and never exceed train end.
         # 0 = synchronized pulses across the group.
         'CS_input_jitter_std': 5 * ms,
-        'US_input_jitter_std': 5 * ms,
+        'US_input_jitter_std': 3 * ms,
 
         'nUnits': 2e3,
         'propInh': 0.20,
-        'propConnect': 0.25,
+        'propConnect': 0.10,
 
         # E: EIF; C and gL chosen so C/gL = 20 ms like sim.jl (taue=20, C=300, g=15 in paper units).
         'eLeakExc': -70 * mV,
@@ -70,15 +71,15 @@ def get_default_params():
         'gLeakExc': 15 * nS,
         'eif_delta_T': 2 * mV,
         'eif_v_peak': 20 * mV,
-        'eif_v_th_spike_jump': 3 * mV,
+        'eif_v_th_spike_jump': 1 * mV,
         'eif_tau_v_th': 30 * ms,
         # Slow adaptation conductance gAdapt: I_adapt = gAdapt * (E_adapt - v) / Cm (hyperpolarizing if E_adapt < v).
         # dgAdapt/dt = (subthreshold_drive * clip(v - E_leak, 0, dep_clip_hi) - gAdapt) / tau_adapt; reset adds eif_gAdapt_spike.
         #   subthreshold_drive scales (v - E_leak)+, not gAdapt. If 0, dg/dt = -gAdapt/tau — spike jumps still adapt via eif_gAdapt_spike.
         #   dep_clip_hi: upper cap on (v - E_leak) for the drive (mV above rest); ~peak - leak is enough headroom.
         'eif_gAdapt_reversal': -85 * mV,
-        'eif_gAdapt_spike': 30 * nS,
-        'eif_gAdapt_subthreshold_drive': 0.08 * nS / mV,
+        'eif_gAdapt_spike': 15 * nS,
+        'eif_gAdapt_subthreshold_drive': 0.04 * nS / mV,
         'eif_tau_w': 150 * ms,
 
         # I: LIF; same C, gL for taui=20 ms in sim.jl; vleaki=-62, threshold vth0=-52 for I spikes.
@@ -138,8 +139,8 @@ def get_default_params():
         # after each trial, NS neurons that fired in the US window potentiate NS->US;
         # NS neurons that did not fire in that window depress NS->US.
         'manual_ns_us_trial_learning': False,
-        'manual_ns_us_trial_pot_delta': 0.3 * nS,
-        'manual_ns_us_trial_dep_delta': 0.3 * nS,
+        'manual_ns_us_trial_pot_delta': 3 * nS,
+        'manual_ns_us_trial_dep_delta': 3 * nS,
 
         # sim.jl tauerise/tauedecay/tauirise/tauidecay (ms)
         'tauRiseExc': 1 * ms,
@@ -152,6 +153,8 @@ def get_default_params():
         'measure_mean_firing_rates': True,
 
         'n_record_voltage': 100,
+        # Exponential low-pass time constant for PCA inputs (binned rates → causal filter, then trial average before fit).
+        'pca_lowpass_tau': 50 * ms,
         'save_checkpoint': True,
         'checkpoint_path': 'results/istdp_network_checkpoint.pkl',
         'load_checkpoint_path': None,

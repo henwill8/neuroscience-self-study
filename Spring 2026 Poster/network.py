@@ -26,6 +26,63 @@ from utils import (
 # EE group block keys for stdp_blocks config (pre_post): CS, US, NS
 STDP_BLOCK_KEYS = ['CS_CS', 'CS_US', 'CS_NS', 'US_CS', 'US_US', 'US_NS', 'NS_CS', 'NS_US', 'NS_NS']
 
+# Trial-end manual NS→US weight updates (same rule as _apply_manual_ns_us_trial_learning), for standalone.
+_MANUAL_NS_US_EE_RUN_REG = (
+    'gEE = clip(gEE + manual_ns_us_syn * manual_trial_end_learn(t) * ('
+    'manual_us_latch_pre * manual_ns_us_pot - int(manual_us_latch_pre < 0.5) * manual_ns_us_dep), '
+    'g_min_EE, g_max_EE)'
+)
+
+
+def _manual_ns_us_timed_arrays(p, dt):
+    """0/1 TimedArrays on the simulation clock for Brian-native manual NS→US learning."""
+    from brian2 import TimedArray
+
+    dt_s = float(dt / second)
+    T_s = float(p['duration'] / second)
+    n = int(np.ceil(T_s / dt_s)) + 5
+    in_us = np.zeros(n, dtype=np.float64)
+    t_start = np.zeros(n, dtype=np.float64)
+    t_end = np.zeros(n, dtype=np.float64)
+
+    # Match _apply_manual_ns_us_trial_learning: per trial, US window is the first interval
+    # whose start lies in [trial_start, trial_end).
+    us_iv = np.asarray(p.get('us_stim_epoch_intervals_s', np.zeros((0, 2))), dtype=np.float64).reshape(-1, 2)
+    trial_starts = np.asarray(p['trial_starts_s'], dtype=np.float64).ravel()
+    trial_dur = float(p['trial_duration_s'])
+    for t0 in trial_starts:
+        t1 = float(t0 + trial_dur)
+        if us_iv.size == 0:
+            continue
+        sel = (us_iv[:, 0] >= t0 - 1e-12) & (us_iv[:, 0] < t1 + 1e-12)
+        if not np.any(sel):
+            continue
+        row = us_iv[np.where(sel)[0][0]]
+        a, b = float(row[0]), float(row[1])
+        if b <= a:
+            continue
+        ia = max(0, int(np.floor(a / dt_s)))
+        ib = min(n, int(np.ceil(b / dt_s)))
+        if ib > ia:
+            in_us[ia:ib] = 1.0
+
+    conds = np.asarray(p['trial_conditions'])
+    for tr, t0 in enumerate(trial_starts):
+        ks = int(np.round(t0 / dt_s))
+        if 0 <= ks < n:
+            t_start[ks] = 1.0
+        t_end_t = float(t0 + trial_dur)
+        if tr < conds.size and str(conds[tr]) != 'CS':
+            ke = int(np.round(t_end_t / dt_s))
+            if 0 <= ke < n:
+                t_end[ke] = 1.0
+
+    return {
+        'manual_in_us': TimedArray(in_us, dt=dt),
+        'manual_trial_start_pulse': TimedArray(t_start, dt=dt),
+        'manual_trial_end_learn': TimedArray(t_end, dt=dt),
+    }
+
 
 # int(...) avoids Relational-in-Mul in Brian's sympy pass for run_regularly.
 # Matches sim.jl LTP: weights[dd,cc] += dt*altp*x[dd]*(v[cc]-thetaltp)*(v_vstdp[cc]-thetaltd) for pre dd -> post cc.
@@ -49,10 +106,34 @@ def _configure_ee_voltage_stdp_ltp(synapsesEE, p):
     synapsesEE.run_regularly(_EE_VSTDP_LTP_RUN_REG, dt=p['dt'], when='end')
 
 
-def _ee_positive_indegree_per_post(synapsesEE, n_exc):
-    """Per postsynaptic E: count of incoming EE synapses with gEE_start > 0."""
-    post = np.asarray(synapsesEE.j, dtype=np.int64)
-    j0 = np.asarray(synapsesEE.gEE_start / siemens, dtype=np.float64)
+def _configure_manual_ns_us_ee_synapses(synapsesEE, pre_ee, post_ee, p):
+    """Trial-end NS→US pot/dep on EE synapses; works with cpp/cuda standalone (no Python between trials)."""
+    if not bool(p.get('manual_ns_us_trial_learning', False)):
+        return
+    tas = p.get('_manual_tas')
+    if tas is None:
+        raise RuntimeError(
+            'Internal: params["_manual_tas"] must be set before building EE synapses when manual_ns_us_trial_learning is on.'
+        )
+    n_exc = int(p['nExc'])
+    cs_inds = np.asarray(p['cs_neuron_inds'], dtype=np.int64).ravel()
+    us_inds = np.asarray(p['us_neuron_inds'], dtype=np.int64).ravel()
+    ns_inds = np.setdiff1d(np.arange(n_exc, dtype=np.int64), np.union1d(cs_inds, us_inds))
+    pre_a = np.asarray(pre_ee, dtype=np.int64)
+    post_a = np.asarray(post_ee, dtype=np.int64)
+    syn_fl = np.isin(pre_a, ns_inds) & np.isin(post_a, us_inds)
+    synapsesEE.manual_ns_us_syn = syn_fl.astype(np.float64)
+    synapsesEE.namespace['manual_trial_end_learn'] = tas['manual_trial_end_learn']
+    pot = p.get('manual_ns_us_trial_pot_delta', 0 * nS)
+    synapsesEE.namespace['manual_ns_us_pot'] = pot
+    synapsesEE.namespace['manual_ns_us_dep'] = p.get('manual_ns_us_trial_dep_delta', pot)
+    synapsesEE.run_regularly(_MANUAL_NS_US_EE_RUN_REG, dt=p['dt'], when='end')
+
+
+def _ee_positive_indegree_per_post(post_inds, g_start_vals, n_exc):
+    """Per postsynaptic E: count of incoming EE synapses with initial gEE_start > 0."""
+    post = np.asarray(post_inds, dtype=np.int64)
+    j0 = np.asarray(g_start_vals, dtype=np.float64)
     positive = (j0 > 0).astype(np.float64)
     return np.bincount(post, weights=positive, minlength=n_exc).astype(np.int64)
 
@@ -78,10 +159,10 @@ _HOMEOSTATIC_RUN_REGULARLY_CODE = (
 )
 
 
-def _configure_homeostatic_run_regularly(synapsesEE, units_exc, p):
+def _configure_homeostatic_run_regularly(synapsesEE, units_exc, p, post_inds, g_start_vals):
     n_exc = int(p['nExc'])
-    j0 = np.asarray(synapsesEE.gEE_start / siemens, dtype=np.float64)
-    posts = np.asarray(synapsesEE.j, dtype=np.int64)
+    j0 = np.asarray(g_start_vals, dtype=np.float64)
+    posts = np.asarray(post_inds, dtype=np.int64)
     sum_start = np.bincount(posts, weights=j0, minlength=n_exc)
     units_exc.S_ee_target = sum_start * siemens
     pos = j0 > 0.0
@@ -339,6 +420,14 @@ class Network:
             '''
         resetCodeExc = resetCodeExc + '; x_vstdp += (1*ms)/taux_vstdp'
 
+        if self._manual_ns_us_learning_enabled():
+            unitModelExc = unitModelExc.strip() + '\n                manual_us_latch : 1\n'
+            # No bitwise OR: Brian's sympy pass does not support | in reset code.
+            resetCodeExc = (
+                resetCodeExc
+                + '; manual_us_latch = clip(int(manual_us_latch > 0.5) + int(manual_in_us(t) > 0.5), 0, 1)'
+            )
+
         threshCodeInh = 'v >= vThresh'
 
         neuron_namespace = {
@@ -361,6 +450,13 @@ class Network:
         }
         if _use_istdp(p):
             neuron_namespace['tau_istdp'] = p['istdp_tau_y']
+        if self._manual_ns_us_learning_enabled():
+            tas = p.get('_manual_tas')
+            if tas is None:
+                raise RuntimeError(
+                    'Internal: params["_manual_tas"] must be set in run() before _build_neurons when manual_ns_us_trial_learning is on.'
+                )
+            neuron_namespace.update(tas)
 
         self._unitsExc = NeuronGroup(
             N=p['nExc'],
@@ -413,6 +509,13 @@ class Network:
         if _use_istdp(p):
             self._unitsExc.y_istdp = 0.0
             self._unitsInh.y_istdp = 0.0
+        if self._manual_ns_us_learning_enabled():
+            self._unitsExc.manual_us_latch = 0.0
+            self._unitsExc.run_regularly(
+                'manual_us_latch = manual_us_latch * int(manual_trial_start_pulse(t) < 0.5)',
+                dt=p['dt'],
+                when='start',
+            )
 
     def _build_cs_us_input(self):
         """SpikeGenerator CS/US with optional per-neuron Gaussian jitter; optional NS perturb."""
@@ -501,6 +604,8 @@ class Network:
                 + '\n                gEE_start : siemens (constant)'
                 + _HOMEOSTATIC_EE_EXTRA_RUN_REG
             )
+        if bool(p.get('manual_ns_us_trial_learning', False)):
+            eqs_EE = eqs_EE.strip() + '\n                manual_ns_us_syn : 1 (constant)\n'
         on_pre_EE = '''
                 x_e_rise_post += gEE / g_filter_ref
                 x_e_decay_post += gEE / g_filter_ref
@@ -511,13 +616,15 @@ class Network:
             model=eqs_EE, on_pre=on_pre_EE,
             namespace={'g_filter_ref': g_ref},
         )
-        preInds, postInds = adjacency_indices_within(p['nExc'], p['propConnect'], rng)
-        synapsesEE.connect(i=preInds, j=postInds)
-        synapsesEE.gEE = normal_weights(p['gEE'], len(synapsesEE), p['weightCV'], rng)
+        pre_ee, post_ee = adjacency_indices_within(p['nExc'], p['propConnect'], rng)
+        synapsesEE.connect(i=pre_ee, j=post_ee)
+        w_ee = normal_weights(p['gEE'], len(synapsesEE), p['weightCV'], rng)
+        synapsesEE.gEE = w_ee
         if use_homeostatic:
-            synapsesEE.gEE_start = synapsesEE.gEE[:]
+            # Standalone backends cannot read variable arrays before run(); copy by expression instead.
+            synapsesEE.gEE_start = 'gEE'
         synapsesEE.block_stdp = _ee_stdp_use_flags(
-            preInds, postInds,
+            pre_ee, post_ee,
             p['cs_neuron_inds'], p['us_neuron_inds'],
             p.get('stdp_blocks'),
         )
@@ -530,6 +637,7 @@ class Network:
             'thetaltd_vstdp': p['thetaltd_vstdp'],
         })
         _configure_ee_voltage_stdp_ltp(synapsesEE, p)
+        _configure_manual_ns_us_ee_synapses(synapsesEE, pre_ee, post_ee, p)
 
         use_istdp = _use_istdp(p)
         if use_istdp:
@@ -570,9 +678,10 @@ class Network:
                     ''',
                 namespace={'g_filter_ref': g_ref},
             )
-        preInds, postInds = adjacency_indices_between(p['nInh'], p['nExc'], p['propConnect'], rng)
-        synapsesEI.connect(i=preInds, j=postInds)
-        synapsesEI.gEI = normal_weights(p['gEI'], len(synapsesEI), p['weightCV'], rng)
+        pre_ei, post_ei = adjacency_indices_between(p['nInh'], p['nExc'], p['propConnect'], rng)
+        synapsesEI.connect(i=pre_ei, j=post_ei)
+        w_ei = normal_weights(p['gEI'], len(synapsesEI), p['weightCV'], rng)
+        synapsesEI.gEI = w_ei
         if use_istdp:
             synapsesEI.plasticity_ei = 1
 
@@ -585,9 +694,10 @@ class Network:
                 ''',
             namespace={'g_filter_ref': g_ref},
         )
-        preInds, postInds = adjacency_indices_between(p['nExc'], p['nInh'], p['propConnect'], rng)
-        synapsesIE.connect(i=preInds, j=postInds)
-        synapsesIE.gIE = normal_weights(p['gIE'], len(synapsesIE), p['weightCV'], rng)
+        pre_ie, post_ie = adjacency_indices_between(p['nExc'], p['nInh'], p['propConnect'], rng)
+        synapsesIE.connect(i=pre_ie, j=post_ie)
+        w_ie = normal_weights(p['gIE'], len(synapsesIE), p['weightCV'], rng)
+        synapsesIE.gIE = w_ie
 
         synapsesII = Synapses(
             model='gII: siemens',
@@ -598,9 +708,10 @@ class Network:
                 ''',
             namespace={'g_filter_ref': g_ref},
         )
-        preInds, postInds = adjacency_indices_within(p['nInh'], p['propConnect'], rng)
-        synapsesII.connect(i=preInds, j=postInds)
-        synapsesII.gII = normal_weights(p['gII'], len(synapsesII), p['weightCV'], rng)
+        pre_ii, post_ii = adjacency_indices_within(p['nInh'], p['propConnect'], rng)
+        synapsesII.connect(i=pre_ii, j=post_ii)
+        w_ii = normal_weights(p['gII'], len(synapsesII), p['weightCV'], rng)
+        synapsesII.gII = w_ii
 
         n_ee, n_ei, n_ie, n_ii = len(synapsesEE), len(synapsesEI), len(synapsesIE), len(synapsesII)
         synapsesEE.delay = ((rng.random(n_ee) * p['delayExc'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
@@ -609,15 +720,21 @@ class Network:
         synapsesII.delay = ((rng.random(n_ii) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
 
         if use_homeostatic:
-            _configure_homeostatic_run_regularly(synapsesEE, unitsExc, p)
+            _configure_homeostatic_run_regularly(synapsesEE, unitsExc, p, post_ee, np.asarray(w_ee / siemens, dtype=float))
 
         self._synapsesEE = synapsesEE
         self._synapsesEI = synapsesEI
         self._synapsesIE = synapsesIE
         self._synapsesII = synapsesII
 
+        p['weight_matrix_pre'] = np.zeros((p['nExc'] + p['nInh'], p['nExc'] + p['nInh']), dtype=float)
+        p['weight_matrix_pre'][np.asarray(post_ee, dtype=np.int64), np.asarray(pre_ee, dtype=np.int64)] = np.asarray(w_ee / siemens, dtype=float)
+        p['weight_matrix_pre'][np.asarray(post_ei, dtype=np.int64), p['nExc'] + np.asarray(pre_ei, dtype=np.int64)] = np.asarray(w_ei / siemens, dtype=float)
+        p['weight_matrix_pre'][p['nExc'] + np.asarray(post_ie, dtype=np.int64), np.asarray(pre_ie, dtype=np.int64)] = np.asarray(w_ie / siemens, dtype=float)
+        p['weight_matrix_pre'][p['nExc'] + np.asarray(post_ii, dtype=np.int64), p['nExc'] + np.asarray(pre_ii, dtype=np.int64)] = np.asarray(w_ii / siemens, dtype=float)
+
         if use_homeostatic:
-            self._ee_indegree_per_post = _ee_positive_indegree_per_post(synapsesEE, p['nExc'])
+            self._ee_indegree_per_post = _ee_positive_indegree_per_post(post_ee, np.asarray(w_ee / siemens, dtype=float), p['nExc'])
 
     def _build_recurrent_synapses_from_checkpoint(self):
         """Build recurrent synapses from params['weight_matrix_post'] (e.g. from a loaded checkpoint)."""
@@ -648,6 +765,8 @@ class Network:
                 + '\n                gEE_start : siemens (constant)'
                 + _HOMEOSTATIC_EE_EXTRA_RUN_REG
             )
+        if bool(p.get('manual_ns_us_trial_learning', False)):
+            eqs_EE = eqs_EE.strip() + '\n                manual_ns_us_syn : 1 (constant)\n'
         on_pre_EE = '''
                 x_e_rise_post += gEE / g_filter_ref
                 x_e_decay_post += gEE / g_filter_ref
@@ -661,7 +780,8 @@ class Network:
         synapsesEE.connect(i=pre_ee, j=post_ee)
         synapsesEE.gEE = w_ee * siemens
         if use_homeostatic:
-            synapsesEE.gEE_start = synapsesEE.gEE[:]
+            # Standalone backends cannot read variable arrays before run(); copy by expression instead.
+            synapsesEE.gEE_start = 'gEE'
         synapsesEE.block_stdp = _ee_stdp_use_flags(
             pre_ee, post_ee,
             p['cs_neuron_inds'], p['us_neuron_inds'],
@@ -676,6 +796,7 @@ class Network:
             'thetaltd_vstdp': p['thetaltd_vstdp'],
         })
         _configure_ee_voltage_stdp_ltp(synapsesEE, p)
+        _configure_manual_ns_us_ee_synapses(synapsesEE, pre_ee, post_ee, p)
 
         # EI: W[0:nExc, nExc:nExc+nInh]
         pre_ei, post_ei, w_ei = connect_from_block(W[0:nExc, nExc : nExc + nInh])
@@ -759,15 +880,17 @@ class Network:
         synapsesII.delay = ((rng.random(n_ii) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
 
         if use_homeostatic:
-            _configure_homeostatic_run_regularly(synapsesEE, unitsExc, p)
+            _configure_homeostatic_run_regularly(synapsesEE, unitsExc, p, post_ee, w_ee)
 
         self._synapsesEE = synapsesEE
         self._synapsesEI = synapsesEI
         self._synapsesIE = synapsesIE
         self._synapsesII = synapsesII
 
+        p['weight_matrix_pre'] = np.asarray(W, dtype=float).copy()
+
         if use_homeostatic:
-            self._ee_indegree_per_post = _ee_positive_indegree_per_post(synapsesEE, nExc)
+            self._ee_indegree_per_post = _ee_positive_indegree_per_post(post_ee, w_ee, nExc)
 
     def _build_monitors(self):
         p = self.params
@@ -793,9 +916,12 @@ class Network:
 
     def _apply_manual_ns_us_trial_learning(self, trial_idx):
         """
-        Trial-end NS->US update:
-        - if NS neuron fired within that trial's US window: NS->US += pot_delta
-        - otherwise: NS->US -= dep_delta
+        Host-side trial-end NS→US update (legacy). Normal runs use Brian `run_regularly` + `manual_us_latch`
+        so cpp/cuda standalone work without Python between trials.
+
+        Rule:
+        - if NS neuron fired within that trial's US window: NS→US += pot_delta
+        - otherwise: NS→US -= dep_delta
         """
         p = self.params
         if not self._manual_ns_us_learning_enabled():
@@ -846,6 +972,44 @@ class Network:
         g = np.clip(g, float(p['g_min_EE'] / siemens), float(p['g_max_EE'] / siemens))
         self._synapsesEE.gEE = g * siemens
 
+    def _append_w_stats_from_gEE_monitor(self, total_s):
+        """Fill w_stats lists from StateMonitor(gEE) after a standalone/GPU single run."""
+        p = self.params
+        mon = self._wEE_mon
+        if mon is None or self._w_stats_t_list is None:
+            return
+        n_syn = int(self._w_stats_i_ee.size)
+        raw = np.asarray(mon.gEE / siemens, dtype=np.float64)
+        if raw.ndim != 2:
+            raise ValueError('Expected 2d gEE monitor array, got shape %s' % (raw.shape,))
+        if raw.shape[0] == n_syn:
+            g_by_t = raw
+        elif raw.shape[1] == n_syn:
+            g_by_t = raw.T
+        else:
+            raise ValueError(
+                'gEE monitor shape %s does not match %d synapses' % (raw.shape, n_syn)
+            )
+        n_t = g_by_t.shape[1]
+        for k in range(n_t):
+            t_k = float(mon.t[k] / second)
+            g = np.asarray(g_by_t[:, k], dtype=np.float64)
+            wi, wo = compute_W_in_W_out_per_assembly(
+                g, self._w_stats_i_ee, self._w_stats_j_ee, self._w_stats_patterns
+            )
+            self._w_stats_t_list.append(t_k)
+            self._w_stats_w_in.append(wi)
+            self._w_stats_w_out.append(wo)
+        t_last = float(mon.t[n_t - 1] / second) if n_t > 0 else -1.0
+        if total_s - t_last > 1e-6:
+            g = np.asarray(self._synapsesEE.gEE / siemens, dtype=np.float64)
+            wi, wo = compute_W_in_W_out_per_assembly(
+                g, self._w_stats_i_ee, self._w_stats_j_ee, self._w_stats_patterns
+            )
+            self._w_stats_t_list.append(total_s)
+            self._w_stats_w_in.append(wi)
+            self._w_stats_w_out.append(wo)
+
     def run(self):
         """Build, run, fill weight_matrix_post and optional checkpoint. Returns monitors tuple."""
         configure_brian_backend(self.params)
@@ -853,6 +1017,11 @@ class Network:
 
         self._derive_population_sizes()
         self._prepare_cs_us_schedule()
+        p_sched = self.params
+        if self._manual_ns_us_learning_enabled():
+            p_sched['_manual_tas'] = _manual_ns_us_timed_arrays(p_sched, p_sched['dt'])
+        else:
+            p_sched.pop('_manual_tas', None)
         self._build_neurons()
         self._build_cs_us_input()
 
@@ -867,15 +1036,10 @@ class Network:
                     % (ckpt_nExc, ckpt_nInh, p['nExc'], p['nInh'])
                 )
             p['weight_matrix_post'] = w_post
-            p['weight_matrix_pre'] = np.asarray(w_post, dtype=float).copy()
             p['load_checkpoint_path'] = None  # so saved checkpoint doesn't re-load this path
             self._build_recurrent_synapses_from_checkpoint()
         else:
             self._build_recurrent_synapses()
-            p['weight_matrix_pre'] = _build_weight_matrix(
-                self._synapsesEE, self._synapsesEI, self._synapsesIE, self._synapsesII,
-                p['nExc'], p['nInh'],
-            )
 
         self._build_monitors()
 
@@ -903,6 +1067,13 @@ class Network:
                     % (float(record_w_dt / second), float(defaultclock.dt / second))
                 )
 
+        standalone_backend = p.get('_brian_backend_used') in ('cpp_standalone', 'cuda_standalone')
+
+        use_gEE_state_monitor = standalone_backend and self._w_stats_chunked_run
+        self._wEE_mon = None
+        if use_gEE_state_monitor:
+            self._wEE_mon = StateMonitor(self._synapsesEE, 'gEE', record=True, dt=record_w_dt)
+
         b2_objects = [
             self._unitsExc,
             self._unitsInh,
@@ -919,10 +1090,21 @@ class Network:
             b2_objects.extend([self._CS_group, self._US_group, self._syn_CS, self._syn_US])
         if self._NS_perturb_group is not None and self._syn_NS_perturb is not None:
             b2_objects.extend([self._NS_perturb_group, self._syn_NS_perturb])
+        if self._wEE_mon is not None:
+            b2_objects.append(self._wEE_mon)
         b2_net = B2Network(*b2_objects)
 
         def _snap_ee_w_stats():
-            g = np.asarray(self._synapsesEE.gEE / siemens, dtype=np.float64)
+            if (
+                float(defaultclock.t / second) == 0.0
+                and p.get('_brian_backend_used') in ('cpp_standalone', 'cuda_standalone')
+                and 'weight_matrix_pre' in p
+            ):
+                # Standalone backends cannot read state arrays before first run; use host-side pre matrix.
+                W_pre = np.asarray(p['weight_matrix_pre'], dtype=float)
+                g = W_pre[self._w_stats_j_ee, self._w_stats_i_ee]
+            else:
+                g = np.asarray(self._synapsesEE.gEE / siemens, dtype=np.float64)
             wi, wo = compute_W_in_W_out_per_assembly(
                 g, self._w_stats_i_ee, self._w_stats_j_ee, self._w_stats_patterns
             )
@@ -930,9 +1112,8 @@ class Network:
             self._w_stats_w_in.append(wi)
             self._w_stats_w_out.append(wo)
 
-        manual_trial_learning = self._manual_ns_us_learning_enabled()
         total_s = float(p['duration'] / second)
-        if self._w_stats_chunked_run or manual_trial_learning:
+        if self._w_stats_chunked_run and not standalone_backend:
             dt_s = float(defaultclock.dt / second)
             checkpoints = [total_s]
             w_checkpoints = np.array([], dtype=float)
@@ -941,14 +1122,9 @@ class Network:
                 w_checkpoints = np.arange(rd_s, total_s + 1e-12, rd_s, dtype=float)
                 checkpoints.extend(w_checkpoints.tolist())
                 _snap_ee_w_stats()
-            trial_end_s = np.array([], dtype=float)
-            if manual_trial_learning:
-                trial_end_s = np.asarray(p['trial_starts_s'], dtype=float).ravel() + float(p['trial_duration_s'])
-                checkpoints.extend(trial_end_s.tolist())
             checkpoints = sorted({float(c) for c in checkpoints if 0.0 < float(c) <= total_s + 1e-12})
 
             t_prev = 0.0
-            next_trial = 0
             next_w = 0
             for t_now in checkpoints:
                 step_s = max(0.0, t_now - t_prev)
@@ -969,15 +1145,26 @@ class Network:
                     )
                 t_prev = t_now
 
-                if manual_trial_learning and trial_end_s.size > 0:
-                    while next_trial < trial_end_s.size and trial_end_s[next_trial] <= t_now + 1e-12:
-                        self._apply_manual_ns_us_trial_learning(next_trial)
-                        next_trial += 1
-
                 if self._w_stats_chunked_run and w_checkpoints.size > 0:
                     while next_w < w_checkpoints.size and w_checkpoints[next_w] <= t_now + 1e-12:
                         _snap_ee_w_stats()
                         next_w += 1
+        elif use_gEE_state_monitor:
+            W_pre = np.asarray(p['weight_matrix_pre'], dtype=float)
+            g0 = W_pre[self._w_stats_j_ee, self._w_stats_i_ee]
+            wi0, wo0 = compute_W_in_W_out_per_assembly(
+                g0, self._w_stats_i_ee, self._w_stats_j_ee, self._w_stats_patterns
+            )
+            self._w_stats_t_list.append(0.0)
+            self._w_stats_w_in.append(wi0)
+            self._w_stats_w_out.append(wo0)
+            b2_net.run(
+                p['duration'],
+                report=p['reportType'],
+                report_period=p['reportPeriod'],
+                profile=use_profile,
+            )
+            self._append_w_stats_from_gEE_monitor(total_s)
         else:
             b2_net.run(
                 p['duration'],

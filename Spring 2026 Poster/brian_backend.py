@@ -1,4 +1,4 @@
-"""Brian2 device selection: use brian2cuda (cuda_standalone) when available, else CPU runtime."""
+"""Brian2 device selection: prefer CUDA, then C++ standalone, then CPU runtime."""
 from __future__ import annotations
 
 import logging
@@ -34,6 +34,25 @@ def _prefer_cython_codegen():
         prefs.codegen.target = 'numpy'
 
 
+def _log_backend_resolved(params, used, *, note=None):
+    """Log requested brian_device vs actual backend (always call before returning from configure)."""
+    from brian2 import prefs
+
+    requested = params.get('brian_device', 'auto')
+    suffix = f"; {note}" if note else ""
+    if used == 'cuda_standalone':
+        msg = f"Brian2 backend: brian_device={requested!r} -> cuda_standalone (brian2cuda){suffix}"
+    elif used == 'cpp_standalone':
+        msg = f"Brian2 backend: brian_device={requested!r} -> cpp_standalone{suffix}"
+    else:
+        msg = (
+            f"Brian2 backend: brian_device={requested!r} -> runtime "
+            f"(codegen={prefs.codegen.target}){suffix}"
+        )
+    print(msg, flush=True)
+    _log.info(msg)
+
+
 def configure_brian_backend(params):
     """
     Call before any NeuronGroup, Synapses, or SpikeGeneratorGroup are created.
@@ -44,7 +63,7 @@ def configure_brian_backend(params):
             cuda — require GPU (raises if setup fails).
             cpu — force CPU runtime (cython or numpy codegen).
 
-    Writes params['_brian_backend_used'] as 'cuda_standalone' or 'runtime'.
+    Writes params['_brian_backend_used'] as 'cuda_standalone', 'cpp_standalone', or 'runtime'.
 
     Notes
     -----
@@ -64,13 +83,22 @@ def configure_brian_backend(params):
         set_device('runtime')
         _prefer_cython_codegen()
         params['_brian_backend_used'] = 'runtime'
+        _log_backend_resolved(params, 'runtime', note='brian_device=cpu')
         return 'runtime'
 
     if mode == 'auto' and not _nvidia_driver_reports_gpu():
-        set_device('runtime')
-        _prefer_cython_codegen()
-        params['_brian_backend_used'] = 'runtime'
-        return 'runtime'
+        try:
+            set_device('cpp_standalone', build_on_run=True)
+            params['_brian_backend_used'] = 'cpp_standalone'
+            _log_backend_resolved(params, 'cpp_standalone', note='no GPU listed by nvidia-smi')
+            return 'cpp_standalone'
+        except Exception as err:
+            _log.warning('cpp_standalone failed (%s); falling back to CPU runtime.', err)
+            set_device('runtime')
+            _prefer_cython_codegen()
+            params['_brian_backend_used'] = 'runtime'
+            _log_backend_resolved(params, 'runtime', note=f'no GPU; cpp_standalone init failed: {err}')
+            return 'runtime'
 
     try:
         import brian2cuda  # noqa: F401 — registers cuda_standalone device
@@ -81,10 +109,18 @@ def configure_brian_backend(params):
                 "On Linux: pip install brian2cuda (requires CUDA toolkit). "
                 "See https://brian2cuda.readthedocs.io/en/latest/introduction/install.html"
             ) from err
-        set_device('runtime')
-        _prefer_cython_codegen()
-        params['_brian_backend_used'] = 'runtime'
-        return 'runtime'
+        try:
+            set_device('cpp_standalone', build_on_run=True)
+            params['_brian_backend_used'] = 'cpp_standalone'
+            _log_backend_resolved(params, 'cpp_standalone', note='brian2cuda not importable')
+            return 'cpp_standalone'
+        except Exception as cpp_err:
+            _log.warning('cpp_standalone failed (%s); falling back to CPU runtime.', cpp_err)
+            set_device('runtime')
+            _prefer_cython_codegen()
+            params['_brian_backend_used'] = 'runtime'
+            _log_backend_resolved(params, 'runtime', note=f'brian2cuda not importable; cpp_standalone init failed: {cpp_err}')
+            return 'runtime'
 
     if sys.platform == 'win32':
         _log.warning(
@@ -100,19 +136,27 @@ def configure_brian_backend(params):
                 'brian_device="cuda" but cuda_standalone could not be initialized. '
                 'Check CUDA toolkit, nvcc, and GPU drivers.'
             ) from err
-        _log.warning('cuda_standalone failed (%s); falling back to CPU runtime.', err)
-        set_device('runtime')
-        _prefer_cython_codegen()
-        params['_brian_backend_used'] = 'runtime'
-        return 'runtime'
+        _log.warning('cuda_standalone failed (%s); trying cpp_standalone.', err)
+        try:
+            set_device('cpp_standalone', build_on_run=True)
+            params['_brian_backend_used'] = 'cpp_standalone'
+            _log_backend_resolved(params, 'cpp_standalone', note=f'cuda_standalone init failed: {err}')
+            return 'cpp_standalone'
+        except Exception as cpp_err:
+            _log.warning('cpp_standalone failed (%s); falling back to CPU runtime.', cpp_err)
+            set_device('runtime')
+            _prefer_cython_codegen()
+            params['_brian_backend_used'] = 'runtime'
+            _log_backend_resolved(params, 'runtime', note=f'cuda_standalone init failed: {err}; cpp_standalone init failed: {cpp_err}')
+            return 'runtime'
 
     params['_brian_backend_used'] = 'cuda_standalone'
-    _log.info('Brian2 device: cuda_standalone (brian2cuda)')
+    _log_backend_resolved(params, 'cuda_standalone')
     return 'cuda_standalone'
 
 
 def effective_profile(params):
-    """Profiling is not supported on cuda_standalone; disable to avoid build/runtime errors."""
-    if params.get('_brian_backend_used') == 'cuda_standalone':
+    """Profiling is not supported on standalone backends; disable to avoid build/runtime errors."""
+    if params.get('_brian_backend_used') in ('cuda_standalone', 'cpp_standalone'):
         return False
     return bool(params.get('doProfile', False))

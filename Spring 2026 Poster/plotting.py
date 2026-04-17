@@ -11,6 +11,15 @@ from mpl_toolkits.mplot3d import Axes3D
 BLACK_YELLOW_CMAP = LinearSegmentedColormap.from_list('black_yellow', ['black', 'yellow'], N=256)
 
 
+def _colors_for_trial_conditions(cond):
+    """One matplotlib color string per trial label. Avoid np.where: Brian2 patches numpy.where for units."""
+    cond = np.asarray(cond)
+    colors = np.full(cond.shape[0], '0.6', dtype=object)
+    colors[cond == 'US'] = 'C0'
+    colors[cond == 'CS'] = 'C3'
+    return colors
+
+
 def _mean_per_neuron_binned_rate_hz(spike_times, spike_indices, neuron_ids, bins, bin_size_s):
     """
     Per time bin: average over neurons in ``neuron_ids`` of each neuron's rate (spikes in bin / bin_width).
@@ -148,6 +157,33 @@ def _hmm_viterbi_poisson(counts, trans_mat, lambda_down, lambda_up):
 # Module-level computation functions (take results + optional params)
 # ---------------------------------------------------------------------------
 
+def _pca_lowpass_tau_s(results, tau_s=None):
+    """Time constant (seconds) for exponential low-pass on PCA spike-derived rates."""
+    if tau_s is not None:
+        return float(tau_s)
+    p = results.p
+    tau = p.get('pca_lowpass_tau', 50 * ms)
+    return float(tau / second)
+
+
+def _lowpass_instantaneous_rates(inst_rates, dt_s, tau_s):
+    """
+    First-order low-pass along time (causal): y[t] = a*y[t-1] + (1-a)*r[t], a = exp(-dt/tau).
+    inst_rates: (n_timepoints, n_neurons) instantaneous rates in Hz.
+    """
+    inst_rates = np.asarray(inst_rates, dtype=float)
+    if inst_rates.size == 0:
+        return inst_rates
+    dt_s = float(dt_s)
+    tau_s = max(float(tau_s), 1e-9)
+    a = np.exp(-dt_s / tau_s)
+    y = np.zeros_like(inst_rates)
+    y[0] = inst_rates[0]
+    for k in range(1, inst_rates.shape[0]):
+        y[k] = a * y[k - 1] + (1.0 - a) * inst_rates[k]
+    return y
+
+
 def compute_population_matrix(results, bin_size=5*ms, use_exc_only=True, subtract_mean=True):
     """Binned firing rate matrix (n_bins, n_neurons)."""
     bin_size_s = float(bin_size / second)
@@ -171,15 +207,127 @@ def compute_population_matrix(results, bin_size=5*ms, use_exc_only=True, subtrac
     return X
 
 
-def compute_pca_projection(results, bin_size=5*ms, use_exc_only=True, n_components=3):
-    """Project binned population activity onto first n_components PCs. Returns (centers, proj)."""
+def compute_full_lowpass_population_matrix(results, bin_size=5*ms, use_exc_only=True,
+                                           subtract_mean=False, tau_s=None):
+    """
+    Full-run instantaneous rate per bin (Hz), then causal low-pass per neuron.
+    Shape (n_bins, n_neurons).
+    """
     bin_size_s = float(bin_size / second)
+    tau_s = _pca_lowpass_tau_s(results, tau_s)
     bins = np.arange(0, results.duration, bin_size_s)
-    centers = bins[:-1] + bin_size_s / 2
-    X = compute_population_matrix(results, bin_size, use_exc_only)
-    U, S, Vt = np.linalg.svd(X, full_matrices=False)
-    proj = X @ Vt[:n_components].T
-    return centers, proj
+    n_bins = len(bins) - 1
+    n_neurons = results.p['nExc'] if use_exc_only else results.p['nUnits']
+    inst = np.zeros((n_bins, n_neurons))
+    for i in range(results.p['nExc']):
+        spikes = results.spikeMonExcT[results.spikeMonExcI == i]
+        counts, _ = np.histogram(spikes, bins)
+        inst[:, i] = counts.astype(float) / bin_size_s
+    if not use_exc_only:
+        for i in range(results.p['nInh']):
+            spikes = results.spikeMonInhT[results.spikeMonInhI == i]
+            counts, _ = np.histogram(spikes, bins)
+            inst[:, results.p['nExc'] + i] = counts.astype(float) / bin_size_s
+    X = _lowpass_instantaneous_rates(inst, bin_size_s, tau_s)
+    if subtract_mean:
+        X = X - X.mean(axis=0)
+    return X
+
+
+def compute_trial_lowpass_data(results, bin_size=5*ms, use_exc_only=True, tau_s=None):
+    """
+    Trial-aligned instantaneous rates (Hz), then causal low-pass in time within each trial.
+    Same layout as compute_trial_binned_data: (n_trials, n_timepoints, n_neurons).
+    """
+    p = results.p
+    if 'trial_starts_s' not in p or 'trial_duration_s' not in p or 'trial_conditions' not in p:
+        return None, None
+    trial_starts_s = np.asarray(p['trial_starts_s'])
+    trial_duration_s = float(p['trial_duration_s'])
+    conditions = np.asarray(p['trial_conditions'])
+    bin_size_s = float(bin_size / second)
+    tau_s = _pca_lowpass_tau_s(results, tau_s)
+    n_trials = len(trial_starts_s)
+    n_timepoints = int(round(trial_duration_s / bin_size_s))
+    if n_timepoints < 1:
+        return None, None
+    n_neurons = p['nExc'] if use_exc_only else p['nUnits']
+    inst = np.zeros((n_trials, n_timepoints, n_neurons))
+    for tr in range(n_trials):
+        t0 = float(trial_starts_s[tr])
+        t1 = t0 + trial_duration_s
+        bins = np.linspace(t0, t1, n_timepoints + 1)
+        for i in range(p['nExc']):
+            spikes = results.spikeMonExcT[results.spikeMonExcI == i]
+            counts, _ = np.histogram(spikes, bins)
+            inst[tr, :, i] = counts[:n_timepoints].astype(float) / bin_size_s
+        if not use_exc_only:
+            for i in range(p['nInh']):
+                spikes = results.spikeMonInhT[results.spikeMonInhI == i]
+                counts, _ = np.histogram(spikes, bins)
+                inst[tr, :, p['nExc'] + i] = counts[:n_timepoints].astype(float) / bin_size_s
+        inst[tr] = _lowpass_instantaneous_rates(inst[tr], bin_size_s, tau_s)
+    return inst, conditions
+
+
+def compute_trial_avg_lowpass_matrix(results, bin_size=5*ms, use_exc_only=True, tau_s=None):
+    """
+    Mean of trial-aligned low-pass population activity across trials: (n_timepoints, n_neurons).
+    None if trial structure unavailable.
+    """
+    data, _conds = compute_trial_lowpass_data(results, bin_size, use_exc_only, tau_s)
+    if data is None:
+        return None
+    return np.mean(np.asarray(data, dtype=float), axis=0)
+
+
+def compute_pca_mean_trajectory_projected(
+    results, bin_size=5 * ms, use_exc_only=True, n_components=3, tau_s=None
+):
+    """
+    PCA on trial-averaged low-pass population activity; return only that mean trajectory in PC space.
+    Time axis is within-trial (0 … trial_duration) when trials are defined, else full-run bin centers.
+
+    Returns
+    -------
+    time_s : (n_time,)
+    proj : (n_time, n_components)
+    pca : sklearn PCA or None if insufficient data
+    """
+    bin_size_s = float(bin_size / second)
+    X_mean = compute_trial_avg_lowpass_matrix(results, bin_size, use_exc_only, tau_s=tau_s)
+    if X_mean is not None and X_mean.shape[0] >= 2:
+        n_tp = X_mean.shape[0]
+        time_s = (np.arange(n_tp) + 0.5) * bin_size_s
+    else:
+        X_mean = compute_full_lowpass_population_matrix(
+            results, bin_size, use_exc_only, subtract_mean=False, tau_s=tau_s
+        )
+        n_tp = X_mean.shape[0]
+        bins = np.arange(0, results.duration, bin_size_s)
+        time_s = bins[:-1] + bin_size_s / 2.0
+    n_comp = min(int(n_components), X_mean.shape[1], X_mean.shape[0] - 1)
+    if n_comp < 1:
+        z = np.zeros((n_tp, max(int(n_components), 1)))
+        return time_s, z, None
+    pca = PCA(n_components=n_comp)
+    pca.fit(X_mean)
+    proj = pca.transform(X_mean)
+    if n_comp < n_components:
+        pad = np.zeros((proj.shape[0], n_components - n_comp))
+        proj = np.hstack([proj, pad])
+    return time_s, proj, pca
+
+
+def compute_pca_projection(results, bin_size=5*ms, use_exc_only=True, n_components=3, tau_s=None):
+    """
+    Mean low-pass trajectory in PC space (same as compute_pca_mean_trajectory_projected).
+    Returns (time_s, proj).
+    """
+    time_s, proj, _ = compute_pca_mean_trajectory_projected(
+        results, bin_size, use_exc_only, n_components, tau_s
+    )
+    return time_s, proj
 
 
 def detect_upstates(results, bin_size=10*ms, use_exc_only=True,
@@ -248,78 +396,76 @@ def compute_within_between_correlations(results, bin_size=5*ms):
     return out
 
 
-def compute_pca_variance_explained(results, bin_size=5*ms, use_exc_only=True):
-    """Variance explained by each PC (%). Full simulation; no upstate masking."""
-    X = compute_population_matrix(results, bin_size, use_exc_only, subtract_mean=False)
-    X = X - X.mean(axis=0)
-    if X.shape[0] < 2:
-        return np.full(3, np.nan)  # not enough data for variance explained
-    U, S, Vt = np.linalg.svd(X, full_matrices=False)
-    var_explained = (S ** 2) / (S ** 2).sum()
-    return var_explained * 100
+def compute_pca_variance_explained(results, bin_size=5*ms, use_exc_only=True, tau_s=None):
+    """Variance explained by each PC (%) from PCA fit on trial-averaged low-pass rates."""
+    X_fit = compute_trial_avg_lowpass_matrix(results, bin_size, use_exc_only, tau_s=tau_s)
+    if X_fit is None or X_fit.shape[0] < 2:
+        X_fit = compute_full_lowpass_population_matrix(
+            results, bin_size, use_exc_only, subtract_mean=False, tau_s=tau_s
+        )
+    if X_fit.shape[0] < 2:
+        return np.full(3, np.nan)
+    n_comp = min(50, X_fit.shape[1], X_fit.shape[0] - 1)
+    if n_comp < 1:
+        return np.full(3, np.nan)
+    pca = PCA(n_components=n_comp)
+    pca.fit(X_fit)
+    return pca.explained_variance_ratio_ * 100.0
+
+
+def _pca_fit_and_project_trials(data, n_components):
+    """
+    data : (n_trials, n_timepoints, n_neurons) low-pass trial-aligned rates.
+    Fit PCA on the trial-averaged trajectory; return that single mean trajectory
+    broadcast for API compatibility (all trials identical).
+    Returns projected_trials (n_trials, n_timepoints, n_comp), n_comp.
+    """
+    data = np.asarray(data)
+    n_trials, n_timepoints, n_neurons = data.shape
+    X_fit = np.mean(data, axis=0)
+    n_samples = X_fit.shape[0]
+    if n_samples < 2:
+        raise ValueError(
+            'PCA needs at least 2 time bins in trial-averaged trajectory; got %d' % n_samples
+        )
+    n_comp = min(int(n_components), n_neurons, n_samples - 1)
+    if n_comp < 1:
+        raise ValueError('PCA: no components (neurons=%d, samples=%d)' % (n_neurons, n_samples))
+    pca = PCA(n_components=n_comp)
+    pca.fit(X_fit)
+    proj_mean = pca.transform(X_fit)
+    projected_trials = np.tile(proj_mean[np.newaxis, :, :], (n_trials, 1, 1))
+    return projected_trials, n_comp
 
 
 def pca_condition_trajectories(data, conditions, n_components, condition_CS='CS', condition_US='US'):
     """
-    Fit PCA on all trials combined, project each trial, compute condition centroids and their distance.
-
-    Parameters
-    ----------
-    data : ndarray, shape (n_trials, n_timepoints, n_neurons)
-        Trial-separated neural population data.
-    conditions : array-like, shape (n_trials,)
-        Condition label per trial (e.g. 'CS' or 'US', or 0/1). Must be comparable to condition_CS / condition_US.
-    n_components : int
-        Number of PCA components.
-    condition_CS : str or scalar
-        Label used for CS trials (default 'CS').
-    condition_US : str or scalar
-        Label used for US trials (default 'US').
+    Fit PCA on trial-averaged activity; projected_trials is the same mean trajectory for every trial index.
+    Centroid_CS / centroid_US collapse to that mean line (condition splits are degenerate).
 
     Returns
     -------
-    projected_trials : ndarray, shape (n_trials, n_timepoints, n_components)
-        Each trial projected into the shared PCA basis.
-    centroid_CS : ndarray, shape (n_timepoints, n_components)
-        Time-resolved centroid of CS trials in PCA space.
-    centroid_US : ndarray, shape (n_timepoints, n_components)
-        Time-resolved centroid of US trials in PCA space.
-    centroid_distance : ndarray, shape (n_timepoints,)
-        Euclidean distance between CS and US centroids at each timepoint.
+    projected_trials, centroid_CS, centroid_US, centroid_distance (all based on the single mean trajectory).
     """
+    _ = (conditions, condition_CS, condition_US)
     data = np.asarray(data)
-    conditions = np.asarray(conditions)
-    n_trials, n_timepoints, n_neurons = data.shape
+    _, n_timepoints, _ = data.shape
 
-    # Fit PCA once on combined data: (samples, neurons)
-    X_all = data.reshape(-1, n_neurons)
-    pca = PCA(n_components=n_components)
-    pca.fit(X_all)
+    projected_trials, n_comp = _pca_fit_and_project_trials(data, n_components)
 
-    # Project each trial into the shared basis
-    projected_trials = np.zeros((n_trials, n_timepoints, n_components))
-    for t in range(n_trials):
-        projected_trials[t] = pca.transform(data[t])  # (n_timepoints, n_components)
-
-    # Condition masks
-    is_CS = (conditions == condition_CS)
-    is_US = (conditions == condition_US)
-    n_CS = np.sum(is_CS)
-    n_US = np.sum(is_US)
-
-    # Time-resolved centroids (average across trials at each timepoint)
-    centroid_CS = np.mean(projected_trials[is_CS], axis=0) if n_CS > 0 else np.full((n_timepoints, n_components), np.nan)
-    centroid_US = np.mean(projected_trials[is_US], axis=0) if n_US > 0 else np.full((n_timepoints, n_components), np.nan)
-
-    # Euclidean distance between centroids over time
-    centroid_distance = np.linalg.norm(centroid_CS - centroid_US, axis=1)
+    mean_traj = projected_trials[0]
+    centroid_CS = np.array(mean_traj, copy=True)
+    centroid_US = np.array(mean_traj, copy=True)
+    centroid_distance = np.zeros(n_timepoints)
 
     return projected_trials, centroid_CS, centroid_US, centroid_distance
 
 
 def compute_trial_binned_data(results, bin_size=5*ms, use_exc_only=True):
     """
-    Build trial-separated binned firing rate matrix from results.
+    Build trial-separated binned firing rate matrix from results (no low-pass).
+    For PCA, prefer compute_trial_lowpass_data (low-pass then trial-averaged fit).
+
     Requires params: trial_starts_s, trial_duration_s, trial_conditions.
 
     Returns
@@ -387,26 +533,18 @@ def compute_mean_firing_rates(results):
     }
 
 
-def compute_ns_trial_trajectories(results, bin_size=5*ms, n_components=3):
+def compute_ns_trial_trajectories(results, bin_size=5*ms, n_components=3, tau_s=None):
     """
-    Bin NS (non-stimulated) excitatory firing over the entire simulation, fit PCA on all bins,
-    and return one trajectory in PC space (not reset per trial).
-
-    Requires params: duration (or results.duration), cs_neuron_inds, us_neuron_inds, nExc.
+    Low-pass NS spike trains; PCA fit on trial-averaged NS activity; return only that mean trajectory in PC space.
+    When trials are undefined, uses full-run low-pass NS as both fit and trajectory.
 
     Returns
     -------
-    projected : ndarray, shape (n_timepoints, n_components)
-        NS population trajectory in PCA space for the full run.
-    time_s : ndarray, shape (n_timepoints,)
-        Simulation time (s) at bin centers.
+    projected : (n_timepoints, n_components)
+    time_s : (n_timepoints,) within-trial time (s) when trial-aligned, else full-run bin centers.
     conditions : None
-        Reserved; per-trial conditions are not used for full-run PCA.
     pca : sklearn PCA
-        Fitted on (n_timepoints, n_ns_neurons) NS binned rates.
     ns_inds : ndarray
-        Indices of NS neurons.
-    or (None, None, None, None, None) if CS/US info missing, no NS neurons, or too few bins.
     """
     p = results.p
     if 'cs_neuron_inds' not in p or 'us_neuron_inds' not in p:
@@ -420,27 +558,52 @@ def compute_ns_trial_trajectories(results, bin_size=5*ms, n_components=3):
 
     T = float(getattr(results, 'duration', float(p['duration'] / second)))
     bin_size_s = float(bin_size / second)
+    tau_s = _pca_lowpass_tau_s(results, tau_s)
     if T <= 0 or bin_size_s <= 0:
         return None, None, None, None, None
-    n_timepoints = int(round(T / bin_size_s))
-    if n_timepoints < 1:
-        return None, None, None, None, None
-    bins = np.linspace(0.0, T, n_timepoints + 1)
     n_ns = len(ns_inds)
-    ns_data = np.zeros((n_timepoints, n_ns))
-    for j, i in enumerate(ns_inds):
-        spikes = results.spikeMonExcT[results.spikeMonExcI == i]
-        counts, _ = np.histogram(spikes, bins)
-        ns_data[:, j] = counts / bin_size_s
 
-    n_components = min(int(n_components), n_ns, n_timepoints - 1)
+    data_tr, _c = compute_trial_lowpass_data(results, bin_size, use_exc_only=True, tau_s=tau_s)
+    if data_tr is not None and data_tr.shape[0] >= 1:
+        ns_tr = data_tr[:, :, ns_inds]
+        X_fit = np.mean(ns_tr, axis=0)
+        n_timepoints = X_fit.shape[0]
+        time_s = (np.arange(n_timepoints) + 0.5) * bin_size_s
+    else:
+        n_timepoints = int(round(T / bin_size_s))
+        if n_timepoints < 1:
+            return None, None, None, None, None
+        bins = np.linspace(0.0, T, n_timepoints + 1)
+        inst_full = np.zeros((n_timepoints, n_ns))
+        for j, i in enumerate(ns_inds):
+            spikes = results.spikeMonExcT[results.spikeMonExcI == i]
+            counts, _ = np.histogram(spikes, bins)
+            inst_full[:, j] = counts.astype(float) / bin_size_s
+        X_fit = _lowpass_instantaneous_rates(inst_full, bin_size_s, tau_s)
+        time_s = (bins[:-1] + bins[1:]) / 2.0
+
+    if X_fit.shape[0] < 2:
+        return None, None, None, None, None
+    n_components = min(int(n_components), n_ns, X_fit.shape[0] - 1)
     if n_components < 1:
         return None, None, None, None, None
     pca = PCA(n_components=n_components)
-    pca.fit(ns_data)
-    projected = pca.transform(ns_data)
-    time_s = (bins[:-1] + bins[1:]) / 2.0
+    pca.fit(X_fit)
+    projected = pca.transform(X_fit)
     return projected, time_s, None, pca, ns_inds
+
+
+def compute_ns_trial_centroid_pca(results, bin_size=5*ms, n_components=3, tau_s=None):
+    """
+    Same geometry as compute_ns_trial_trajectories (mean NS trajectory in PC space).
+    Returns (proj, time_s, pca) for line plots; conditions dropped (None).
+    """
+    projected, time_s, _cond, pca, _ns = compute_ns_trial_trajectories(
+        results, bin_size=bin_size, n_components=n_components, tau_s=tau_s
+    )
+    if projected is None:
+        return None, None, None
+    return projected, time_s, pca
 
 
 def _binary_auc_from_scores(y_true, scores):
@@ -941,40 +1104,40 @@ class SimpleResults:
 
     def plot_pca_3d_time_color(self, ax=None, bin_size=5*ms, use_exc_only=True,
                                line_alpha=0.85, line_lw=0.8, cmap='viridis'):
-        bin_size_s = float(bin_size / second)
-        bins = np.arange(0, self.duration, bin_size_s)
-        centers = bins[:-1] + bin_size_s / 2
-        X = compute_population_matrix(self, bin_size, use_exc_only, subtract_mean=False)
-        X_use = X - X.mean(axis=0)
-        centers_use = centers
-
-        if X_use.shape[0] < 2:
+        time_s, proj, pca = compute_pca_mean_trajectory_projected(
+            self, bin_size, use_exc_only, n_components=3
+        )
+        if proj.shape[0] < 2 or pca is None:
             if ax is None:
                 fig, ax = plt.subplots(subplot_kw=dict(projection='3d'))
             ax.set_title("First 3 PCs (insufficient time bins)")
             return ax
-        _, _, Vt = np.linalg.svd(X_use, full_matrices=False)
-        proj = X_use @ Vt[:3].T
-        for j in range(3):
+        for j in range(min(3, proj.shape[1])):
             col = proj[:, j]
             proj[:, j] = (col - col.mean()) / (col.std() + 1e-10)
         pc1, pc2, pc3 = proj[:, 0], proj[:, 1], proj[:, 2]
-        t_plot = centers_use
+        t_plot = time_s
+        t_label = (
+            "Time within trial (s)"
+            if 'trial_starts_s' in self.p and 'trial_duration_s' in self.p
+            else "Time (s)"
+        )
 
         if ax is None:
             fig = plt.figure()
             ax = fig.add_subplot(111, projection='3d')
         norm = Normalize(vmin=t_plot.min(), vmax=t_plot.max())
+        cmap_obj = plt.get_cmap(cmap)
         for i in range(len(pc1) - 1):
-            c = plt.get_cmap(cmap)(norm((t_plot[i] + t_plot[i + 1]) / 2))
+            c = cmap_obj(norm((t_plot[i] + t_plot[i + 1]) / 2))
             ax.plot(pc1[i:i+2], pc2[i:i+2], pc3[i:i+2], color=c, alpha=line_alpha, lw=line_lw)
-        sm = cm.ScalarMappable(norm=norm, cmap=plt.get_cmap(cmap))
+        sm = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
         sm.set_array([])
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.set_zlabel("PC3")
-        ax.set_title("First 3 PCs (full simulation)")
-        plt.colorbar(sm, ax=ax, shrink=0.6, label="Time (s)")
+        ax.set_title("Mean trial trajectory in PC space (low-pass)")
+        plt.colorbar(sm, ax=ax, shrink=0.6, label=t_label)
         return ax
 
     def plot_within_between_correlations(self, ax=None, bin_size=5*ms):
@@ -1010,67 +1173,51 @@ class SimpleResults:
             ax.plot(x, var_pct, 'o-', color='steelblue', markersize=3)
         ax.set_xlabel("Principal component")
         ax.set_ylabel("Variance explained (%)")
-        ax.set_title("PCA variance explained (full simulation)")
+        ax.set_title("PCA variance explained (trial-avg low-pass)")
         return ax
 
     def plot_pca_centroid_trajectories(self, bin_size=5*ms, n_components=3,
-                                       ax_traj=None, ax_dist=None, use_exc_only=True):
+                                       ax_traj=None, ax_dist=None, use_exc_only=True,
+                                       cmap='viridis', line_alpha=0.9, line_lw=1.0):
         """
-        Build trial-separated binned data, fit PCA on all trials, project and compute CS/US centroids,
-        then plot centroid trajectories (3D PC1–PC2–PC3) and centroid distance over time.
-        Requires params: trial_starts_s, trial_duration_s, trial_conditions.
-        Returns the figure if one was created, else None.
+        Single 3D line: trial-averaged low-pass population trajectory in PC space, colored by time.
+        Requires trial schedule for within-trial time axis; otherwise same as full-run mean trajectory.
+        ax_dist is ignored (kept for call compatibility).
         """
-        data, conditions = compute_trial_binned_data(self, bin_size, use_exc_only)
-        if data is None or data.size == 0:
-            return None
-        # Need both conditions to have at least one trial
-        uniq = np.unique(conditions)
-        if len(uniq) < 2:
-            return None
-        projected_trials, centroid_CS, centroid_US, centroid_distance = pca_condition_trajectories(
-            data, conditions, n_components, condition_CS='CS', condition_US='US'
+        time_s, proj, pca = compute_pca_mean_trajectory_projected(
+            self, bin_size, use_exc_only, n_components=n_components
         )
-        bin_size_s = float(bin_size / second)
-        trial_duration_s = self.p['trial_duration_s']
-        n_timepoints = centroid_CS.shape[0]
-        time_s = (np.arange(n_timepoints) + 0.5) * bin_size_s
+        if proj is None or pca is None or proj.shape[0] < 2:
+            return None
+        cent = np.asarray(proj, dtype=float)
+        if cent.shape[1] < 3:
+            cent = np.hstack([cent, np.zeros((cent.shape[0], 3 - cent.shape[1]))])
+        else:
+            cent = cent[:, :3]
 
         if ax_traj is None and ax_dist is None:
-            fig = plt.figure(figsize=(12, 5))
-            ax_traj = fig.add_subplot(1, 2, 1, projection='3d')
-            ax_dist = fig.add_subplot(1, 2, 2)
+            fig = plt.figure(figsize=(7, 6))
+            ax_traj = fig.add_subplot(1, 1, 1, projection='3d')
             created_fig = fig
         else:
             created_fig = None
             if ax_traj is None:
                 ax_traj = plt.gca()
-            if ax_dist is None:
-                ax_dist = plt.gca()
 
-        # Left: 3D trajectory (PC1, PC2, PC3)
-        for ax_cur, cent, label, color in [
-            (ax_traj, centroid_CS, 'CS', 'C3'),
-            (ax_traj, centroid_US, 'US', 'C0'),
-        ]:
-            if np.any(np.isfinite(cent)):
-                ax_cur.plot(cent[:, 0], cent[:, 1], cent[:, 2], color=color, lw=2, alpha=0.9, label=label)
-                step = max(1, n_timepoints // 8)
-                for k in range(0, n_timepoints, step):
-                    ax_cur.scatter(cent[k, 0], cent[k, 1], cent[k, 2], c=[color], s=20, edgecolors='k', linewidths=0.5)
+        norm = Normalize(vmin=float(time_s.min()), vmax=float(time_s.max()))
+        cmap_obj = plt.get_cmap(cmap)
+        pc1, pc2, pc3 = cent[:, 0], cent[:, 1], cent[:, 2]
+        for i in range(len(time_s) - 1):
+            c = cmap_obj(norm((time_s[i] + time_s[i + 1]) / 2))
+            ax_traj.plot(pc1[i : i + 2], pc2[i : i + 2], pc3[i : i + 2], color=c, alpha=line_alpha, lw=line_lw)
+        sm = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
+        sm.set_array([])
         ax_traj.set_xlabel("PC1")
         ax_traj.set_ylabel("PC2")
         ax_traj.set_zlabel("PC3")
-        ax_traj.set_title("Condition centroid trajectories")
-        ax_traj.legend(loc='best')
-
-        # Right: centroid distance over time within trial
-        ax_dist.plot(time_s, centroid_distance, 'k-', lw=1.5)
-        ax_dist.fill_between(time_s, 0, centroid_distance, alpha=0.2)
-        ax_dist.set_xlabel("Time within trial (s)")
-        ax_dist.set_ylabel("CS–US centroid distance")
-        ax_dist.set_title("Centroid distance over time")
-        ax_dist.set_xlim(0, trial_duration_s)
+        ax_traj.set_title("Mean trial trajectory (low-pass PCA)")
+        t_lbl = "Time within trial (s)" if 'trial_starts_s' in self.p else "Time (s)"
+        plt.colorbar(sm, ax=ax_traj, shrink=0.6, label=t_lbl)
 
         if created_fig:
             created_fig.tight_layout()
@@ -1090,28 +1237,7 @@ class SimpleResults:
     def plot_ns_trial_trajectories(self, bin_size=5*ms, n_components=3, ax_2d=None, ax_3d=None,
                                    color_by_time=True, cmap='viridis', alpha=0.75, linewidth=1.2):
         """
-        Plot the NS population trajectory in PCA space for the full simulation (one continuous path).
-        Color indicates simulation time (early→late) when color_by_time is True.
-
-        Parameters
-        ----------
-        bin_size : Quantity
-            Time bin for binned firing rates.
-        n_components : int
-            Number of PCA components (2 or 3 for plotting).
-        ax_2d, ax_3d : matplotlib axes, optional
-            If provided, draw in these axes (ax_2d = PC1 vs PC2, ax_3d = 3D). If both None, create a figure with 2 panels.
-        color_by_time : bool
-            If True, color by simulation time; else use a single color.
-        cmap : str
-            Colormap name for time (e.g. 'viridis', 'plasma').
-        alpha, linewidth : float
-            Line transparency and width.
-
-        Returns
-        -------
-        fig or None
-            The figure if one was created, else None.
+        Mean NS trajectory in PC space (trial-averaged low-pass), one line colored by time.
         """
         out = compute_ns_trial_trajectories(self, bin_size=bin_size, n_components=max(n_components, 2))
         projected, time_s, _conditions, pca, ns_inds = out
@@ -1136,6 +1262,7 @@ class SimpleResults:
 
         norm = Normalize(vmin=time_s.min(), vmax=time_s.max())
         cmap_obj = plt.get_cmap(cmap)
+        t_lbl = "Time within trial (s)" if 'trial_starts_s' in self.p else "Time (s)"
 
         for t in range(n_timepoints - 1):
             c = cmap_obj(norm((time_s[t] + time_s[t + 1]) / 2)) if color_by_time else '0.5'
@@ -1154,26 +1281,62 @@ class SimpleResults:
 
         ax_2d.set_xlabel("PC1 (NS)")
         ax_2d.set_ylabel("PC2 (NS)")
-        ax_2d.set_title("NS population trajectory (full simulation)")
+        ax_2d.set_title("Mean NS trajectory (low-pass PCA)")
         ax_2d.set_aspect('equal', adjustable='datalim')
         ax_2d.axhline(0, color='k', lw=0.3, alpha=0.5)
         ax_2d.axvline(0, color='k', lw=0.3, alpha=0.5)
         if color_by_time:
             sm = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
             sm.set_array([])
-            plt.colorbar(sm, ax=ax_2d, shrink=0.7, label="Time (s)")
+            plt.colorbar(sm, ax=ax_2d, shrink=0.7, label=t_lbl)
 
         if ax_3d is not None and nc >= 3:
             ax_3d.set_xlabel("PC1 (NS)")
             ax_3d.set_ylabel("PC2 (NS)")
             ax_3d.set_zlabel("PC3 (NS)")
-            ax_3d.set_title("NS trajectory 3D (full simulation)")
+            ax_3d.set_title("Mean NS trajectory 3D")
             if color_by_time:
-                plt.colorbar(sm, ax=ax_3d, shrink=0.6, label="Time (s)")
+                plt.colorbar(sm, ax=ax_3d, shrink=0.6, label=t_lbl)
 
         if create_fig and fig_out is not None:
             fig_out.tight_layout()
         return fig_out
+
+    def plot_ns_trial_centroid_pca(self, bin_size=5*ms, n_components=3, ax=None, cmap='viridis'):
+        """
+        Same mean NS trajectory as plot_ns_trial_trajectories: PC1 vs PC2 (and color by time).
+        """
+        proj, time_s, pca = compute_ns_trial_centroid_pca(self, bin_size=bin_size, n_components=n_components)
+        if proj is None or time_s is None or pca is None:
+            return None
+        created_fig = None
+        if ax is None:
+            created_fig, ax = plt.subplots(figsize=(6, 5))
+        n_tp, n_pc = proj.shape
+        t_lbl = "Time within trial (s)" if 'trial_starts_s' in self.p else "Time (s)"
+        norm = Normalize(vmin=float(time_s.min()), vmax=float(time_s.max()))
+        cmap_obj = plt.get_cmap(cmap)
+        if n_pc >= 2:
+            for i in range(n_tp - 1):
+                c = cmap_obj(norm((time_s[i] + time_s[i + 1]) / 2))
+                ax.plot(proj[i : i + 2, 0], proj[i : i + 2, 1], color=c, lw=1.5, alpha=0.9)
+            ax.set_xlabel('PC1 (NS)')
+            ax.set_ylabel('PC2 (NS)')
+        else:
+            for i in range(n_tp - 1):
+                c = cmap_obj(norm((time_s[i] + time_s[i + 1]) / 2))
+                ax.plot(time_s[i : i + 2], proj[i : i + 2, 0], color=c, lw=1.5, alpha=0.9)
+            ax.set_xlabel(t_lbl)
+            ax.set_ylabel('PC1 (NS)')
+        ax.axhline(0, color='k', lw=0.4, alpha=0.4)
+        ax.axvline(0, color='k', lw=0.4, alpha=0.4)
+        ax.set_title('Mean NS trajectory (low-pass PCA)')
+        sm = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, shrink=0.8, label=t_lbl)
+        if created_fig is not None:
+            created_fig.tight_layout()
+        return created_fig
 
     def plot_readout_evaluations(self, bin_size=10*ms, max_lag_bins=40, axes=None):
         """
@@ -1222,7 +1385,7 @@ class SimpleResults:
             cond = np.asarray(m['trial_conditions'])
             rates = np.asarray(m['trial_rates_Hz'], dtype=float)
             x = np.arange(rates.size)
-            color = np.where(cond == 'US', 'C0', np.where(cond == 'CS', 'C3', '0.6'))
+            color = _colors_for_trial_conditions(cond)
             ax_us.scatter(x, rates, c=color, s=20, alpha=0.85)
             w0, w1 = m['us_window_s']
             ax_us.set_xlabel("Trial")
@@ -1326,7 +1489,7 @@ class SimpleResults:
 def plot_all_figures(results, show=True):
     """
     Create the standard poster figures from a SimpleResults instance.
-    Returns (fig1, fig2, fig3, fig4, fig5, fig6, fig7). If show is True, calls plt.show() at the end.
+    Returns (fig1, fig2, fig3, fig4, fig5, fig6, fig7, fig8). If show is True, calls plt.show() at the end.
     fig5: NS population PCA trajectory over the full simulation time.
     fig6: W_in / W_out time series for CS, US, NS (None if not recorded).
     fig7: Reservoir/readout evaluation panel (decodability, memory, US readout score).
@@ -1372,8 +1535,9 @@ def plot_all_figures(results, show=True):
     fig6 = results.plot_ee_w_in_w_out()
 
     fig7 = results.plot_readout_evaluations(bin_size=10*ms, max_lag_bins=40)
+    fig8 = results.plot_ns_trial_centroid_pca(bin_size=10*ms, n_components=3)
 
     if show:
         plt.show()
-    return fig1, fig2, fig3, fig4, fig5, fig6, fig7
+    return fig1, fig2, fig3, fig4, fig5, fig6, fig7, fig8
 
