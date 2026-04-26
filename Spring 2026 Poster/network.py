@@ -26,12 +26,41 @@ from utils import (
 # EE group block keys for stdp_blocks config (pre_post): CS, US, NS
 STDP_BLOCK_KEYS = ['CS_CS', 'CS_US', 'CS_NS', 'US_CS', 'US_US', 'US_NS', 'NS_CS', 'NS_US', 'NS_NS']
 
-# Trial-end manual NS→US weight updates (same rule as _apply_manual_ns_us_trial_learning), for standalone.
+# Trial-end manual NS→US: Δg ∝ ⟨r⟩_US − ⟨r⟩_baseline (spike counts / window length), for standalone.
 _MANUAL_NS_US_EE_RUN_REG = (
-    'gEE = clip(gEE + manual_ns_us_syn * manual_trial_end_learn(t) * ('
-    'manual_us_latch_pre * manual_ns_us_pot - int(manual_us_latch_pre < 0.5) * manual_ns_us_dep), '
+    'gEE = clip(gEE + manual_ns_us_syn * manual_trial_end_learn(t) * manual_ns_us_diff_eta * ('
+    'n_us_spikes_pre / manual_T_us_s - n_bl_spikes_pre / manual_T_bl_s), '
     'g_min_EE, g_max_EE)'
 )
+
+
+def _manual_ns_us_rate_window_seconds(p):
+    """
+    US window length and baseline (= trial \\ US) length in seconds for a typical paired trial.
+    Used so ⟨r⟩ = spike_count / T with comparable Hz scales.
+    """
+    trial_dur = float(p['trial_duration_s'])
+    us_iv = np.asarray(p.get('us_stim_epoch_intervals_s', np.zeros((0, 2))), dtype=np.float64).reshape(-1, 2)
+    trial_starts = np.asarray(p['trial_starts_s'], dtype=np.float64).ravel()
+    conds = np.asarray(p['trial_conditions'])
+    for tr, t0 in enumerate(trial_starts):
+        if tr < conds.size and str(conds[tr]) == 'CS':
+            continue
+        t1 = float(t0 + trial_dur)
+        if us_iv.size == 0:
+            break
+        sel = (us_iv[:, 0] >= t0 - 1e-12) & (us_iv[:, 0] < t1 + 1e-12)
+        if not np.any(sel):
+            continue
+        row = us_iv[np.where(sel)[0][0]]
+        a, b = float(row[0]), float(row[1])
+        if b <= a:
+            continue
+        t_us = b - a
+        t_bl = max(trial_dur - t_us, 1e-9)
+        return t_us, t_bl
+    t_us = float(p['US_train_duration'] / second)
+    return t_us, max(trial_dur - t_us, 1e-9)
 
 
 def _manual_ns_us_timed_arrays(p, dt):
@@ -42,6 +71,7 @@ def _manual_ns_us_timed_arrays(p, dt):
     T_s = float(p['duration'] / second)
     n = int(np.ceil(T_s / dt_s)) + 5
     in_us = np.zeros(n, dtype=np.float64)
+    in_trial = np.zeros(n, dtype=np.float64)
     t_start = np.zeros(n, dtype=np.float64)
     t_end = np.zeros(n, dtype=np.float64)
 
@@ -52,6 +82,10 @@ def _manual_ns_us_timed_arrays(p, dt):
     trial_dur = float(p['trial_duration_s'])
     for t0 in trial_starts:
         t1 = float(t0 + trial_dur)
+        ia = max(0, int(np.floor(t0 / dt_s)))
+        ib = min(n, int(np.ceil(t1 / dt_s)))
+        if ib > ia:
+            in_trial[ia:ib] = 1.0
         if us_iv.size == 0:
             continue
         sel = (us_iv[:, 0] >= t0 - 1e-12) & (us_iv[:, 0] < t1 + 1e-12)
@@ -66,6 +100,8 @@ def _manual_ns_us_timed_arrays(p, dt):
         if ib > ia:
             in_us[ia:ib] = 1.0
 
+    in_baseline = in_trial * (1.0 - in_us)
+
     conds = np.asarray(p['trial_conditions'])
     for tr, t0 in enumerate(trial_starts):
         ks = int(np.round(t0 / dt_s))
@@ -77,8 +113,13 @@ def _manual_ns_us_timed_arrays(p, dt):
             if 0 <= ke < n:
                 t_end[ke] = 1.0
 
+    t_us_s, t_bl_s = _manual_ns_us_rate_window_seconds(p)
+    p['_manual_T_us_s'] = t_us_s
+    p['_manual_T_bl_s'] = t_bl_s
+
     return {
         'manual_in_us': TimedArray(in_us, dt=dt),
+        'manual_in_baseline': TimedArray(in_baseline, dt=dt),
         'manual_trial_start_pulse': TimedArray(t_start, dt=dt),
         'manual_trial_end_learn': TimedArray(t_end, dt=dt),
     }
@@ -107,7 +148,7 @@ def _configure_ee_voltage_stdp_ltp(synapsesEE, p):
 
 
 def _configure_manual_ns_us_ee_synapses(synapsesEE, pre_ee, post_ee, p):
-    """Trial-end NS→US pot/dep on EE synapses; works with cpp/cuda standalone (no Python between trials)."""
+    """Trial-end NS→US: Δg ∝ ⟨r⟩_US − ⟨r⟩_baseline (cpp/cuda standalone)."""
     if not bool(p.get('manual_ns_us_trial_learning', False)):
         return
     tas = p.get('_manual_tas')
@@ -124,9 +165,15 @@ def _configure_manual_ns_us_ee_synapses(synapsesEE, pre_ee, post_ee, p):
     syn_fl = np.isin(pre_a, ns_inds) & np.isin(post_a, us_inds)
     synapsesEE.manual_ns_us_syn = syn_fl.astype(np.float64)
     synapsesEE.namespace['manual_trial_end_learn'] = tas['manual_trial_end_learn']
-    pot = p.get('manual_ns_us_trial_pot_delta', 0 * nS)
-    synapsesEE.namespace['manual_ns_us_pot'] = pot
-    synapsesEE.namespace['manual_ns_us_dep'] = p.get('manual_ns_us_trial_dep_delta', pot)
+    t_us = float(p.get('_manual_T_us_s', 80e-3))
+    t_bl = float(p.get('_manual_T_bl_s', 360e-3))
+    synapsesEE.namespace['manual_T_us_s'] = t_us * second
+    synapsesEE.namespace['manual_T_bl_s'] = t_bl * second
+    eta = p.get('manual_ns_us_diff_eta')
+    if eta is None:
+        pot = p.get('manual_ns_us_trial_pot_delta', 3 * nS)
+        eta = pot * second
+    synapsesEE.namespace['manual_ns_us_diff_eta'] = eta
     synapsesEE.run_regularly(_MANUAL_NS_US_EE_RUN_REG, dt=p['dt'], when='end')
 
 
@@ -149,34 +196,63 @@ def _use_istdp(p):
 
 _HOMEOSTATIC_EE_EXTRA_RUN_REG = '''
                 S_ee_in_post = gEE : siemens (summed)
+                S_ee_out_pre = gEE : siemens (summed)
                 nee_pos : 1 (constant)
                 homeo_apply : 1 (constant)
 '''
 
-_HOMEOSTATIC_RUN_REGULARLY_CODE = (
+_HOMEOSTATIC_RUN_REGULARLY_CODE_INPUT = (
     'gEE = clip(gEE - homeostatic_norm_beta * (S_ee_in_post - S_ee_target_post) / nee_pos * homeo_apply, '
     'g_min_EE, g_max_EE)'
 )
 
 
-def _configure_homeostatic_run_regularly(synapsesEE, units_exc, p, post_inds, g_start_vals):
+_HOMEOSTATIC_RUN_REGULARLY_CODE_OUTPUT = (
+    'gEE = clip(gEE - homeostatic_norm_beta * (S_ee_out_pre - S_ee_target_pre) / nee_pos * homeo_apply, '
+    'g_min_EE, g_max_EE)'
+)
+
+
+def _homeostatic_norm_mode(p):
+    """
+    Homeostatic normalization mode:
+      - 'row': postsynaptic incoming EE sum target (default; sim.jl-style)
+      - 'column': presynaptic outgoing EE sum target
+    """
+    mode = str(p.get('homeostatic_norm_mode', 'row')).strip().lower()
+    if mode not in ('row', 'column'):
+        raise ValueError(
+            f"Invalid homeostatic_norm_mode={mode!r}; expected 'row' or 'column'."
+        )
+    return mode
+
+
+def _configure_homeostatic_run_regularly(synapsesEE, units_exc, p, pre_inds, post_inds, g_start_vals):
     n_exc = int(p['nExc'])
     j0 = np.asarray(g_start_vals, dtype=np.float64)
+    pres = np.asarray(pre_inds, dtype=np.int64)
     posts = np.asarray(post_inds, dtype=np.int64)
-    sum_start = np.bincount(posts, weights=j0, minlength=n_exc)
+    mode = _homeostatic_norm_mode(p)
+    norm_inds = posts if mode == 'row' else pres
+    sum_start = np.bincount(norm_inds, weights=j0, minlength=n_exc)
     units_exc.S_ee_target = sum_start * siemens
     pos = j0 > 0.0
-    cpos = np.bincount(posts, weights=pos.astype(np.float64), minlength=n_exc)
+    cpos = np.bincount(norm_inds, weights=pos.astype(np.float64), minlength=n_exc)
     cpos = np.maximum(cpos, 1.0)
-    synapsesEE.nee_pos = cpos[posts]
+    synapsesEE.nee_pos = cpos[norm_inds]
     synapsesEE.homeo_apply = pos.astype(np.float64)
     synapsesEE.namespace['homeostatic_norm_beta'] = float(p.get('homeostatic_norm_beta', 1.0))
     synapsesEE.namespace['g_min_EE'] = p['g_min_EE']
     synapsesEE.namespace['g_max_EE'] = p['g_max_EE']
+    run_reg_code = (
+        _HOMEOSTATIC_RUN_REGULARLY_CODE_INPUT
+        if mode == 'row'
+        else _HOMEOSTATIC_RUN_REGULARLY_CODE_OUTPUT
+    )
     # Must run after the 'synapses' slot: S_ee_in_post = gEE (summed) is updated there.
     # Default when='start' reads stale/zero summed input → spurious (S_ee_in - S_ee_target) and weight explosion.
     synapsesEE.run_regularly(
-        _HOMEOSTATIC_RUN_REGULARLY_CODE,
+        run_reg_code,
         dt=p['homeostatic_norm_period'],
         when='end',
     )
@@ -410,7 +486,10 @@ class Network:
         threshCodeExc = 'v > v_peak_eif'
 
         if _use_homeostatic_run_regularly(p):
-            unitModelExc = unitModelExc.strip() + '\n                S_ee_in : siemens\n                S_ee_target : siemens\n'
+            unitModelExc = (
+                unitModelExc.strip()
+                + '\n                S_ee_in : siemens\n                S_ee_out : siemens\n                S_ee_target : siemens\n'
+            )
 
         # vSTDP traces: u = low-pass v (tauu), v_lp = second low-pass v (tauv) as v_vstdp in sim.jl; x dimensionless with spike +1/tau_x as in Julia (x += 1/taux with taux in ms).
         unitModelExc = unitModelExc.strip() + '''
@@ -421,11 +500,11 @@ class Network:
         resetCodeExc = resetCodeExc + '; x_vstdp += (1*ms)/taux_vstdp'
 
         if self._manual_ns_us_learning_enabled():
-            unitModelExc = unitModelExc.strip() + '\n                manual_us_latch : 1\n'
-            # No bitwise OR: Brian's sympy pass does not support | in reset code.
+            unitModelExc = unitModelExc.strip() + '\n                n_us_spikes : integer\n                n_bl_spikes : integer\n'
             resetCodeExc = (
                 resetCodeExc
-                + '; manual_us_latch = clip(int(manual_us_latch > 0.5) + int(manual_in_us(t) > 0.5), 0, 1)'
+                + '; n_us_spikes = n_us_spikes + int(manual_in_us(t) > 0.5)'
+                + '; n_bl_spikes = n_bl_spikes + int(manual_in_baseline(t) > 0.5)'
             )
 
         threshCodeInh = 'v >= vThresh'
@@ -510,9 +589,11 @@ class Network:
             self._unitsExc.y_istdp = 0.0
             self._unitsInh.y_istdp = 0.0
         if self._manual_ns_us_learning_enabled():
-            self._unitsExc.manual_us_latch = 0.0
+            self._unitsExc.n_us_spikes = 0
+            self._unitsExc.n_bl_spikes = 0
             self._unitsExc.run_regularly(
-                'manual_us_latch = manual_us_latch * int(manual_trial_start_pulse(t) < 0.5)',
+                'n_us_spikes = n_us_spikes * int(manual_trial_start_pulse(t) < 0.5); '
+                'n_bl_spikes = n_bl_spikes * int(manual_trial_start_pulse(t) < 0.5)',
                 dt=p['dt'],
                 when='start',
             )
@@ -720,7 +801,14 @@ class Network:
         synapsesII.delay = ((rng.random(n_ii) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
 
         if use_homeostatic:
-            _configure_homeostatic_run_regularly(synapsesEE, unitsExc, p, post_ee, np.asarray(w_ee / siemens, dtype=float))
+            _configure_homeostatic_run_regularly(
+                synapsesEE,
+                unitsExc,
+                p,
+                pre_ee,
+                post_ee,
+                np.asarray(w_ee / siemens, dtype=float),
+            )
 
         self._synapsesEE = synapsesEE
         self._synapsesEI = synapsesEI
@@ -880,7 +968,7 @@ class Network:
         synapsesII.delay = ((rng.random(n_ii) * p['delayInh'] / defaultclock.dt).astype(int) + 1) * defaultclock.dt
 
         if use_homeostatic:
-            _configure_homeostatic_run_regularly(synapsesEE, unitsExc, p, post_ee, w_ee)
+            _configure_homeostatic_run_regularly(synapsesEE, unitsExc, p, pre_ee, post_ee, w_ee)
 
         self._synapsesEE = synapsesEE
         self._synapsesEI = synapsesEI
@@ -901,6 +989,10 @@ class Network:
         if n_rec is None:
             record_exc = True
             record_inh = True
+        elif int(n_rec) <= 0:
+            # Poster / batch: record one E and one I trace only (keeps SimpleResults API small).
+            record_exc = np.array([0], dtype=int)
+            record_inh = np.array([0], dtype=int)
         else:
             n_re = min(int(n_rec), p['nExc'])
             n_ri = min(int(n_rec), p['nInh'])
@@ -916,12 +1008,9 @@ class Network:
 
     def _apply_manual_ns_us_trial_learning(self, trial_idx):
         """
-        Host-side trial-end NS→US update (legacy). Normal runs use Brian `run_regularly` + `manual_us_latch`
-        so cpp/cuda standalone work without Python between trials.
+        Host-side trial-end NS→US (legacy). Normal runs use Brian `run_regularly` + spike counts.
 
-        Rule:
-        - if NS neuron fired within that trial's US window: NS→US += pot_delta
-        - otherwise: NS→US -= dep_delta
+        Δg_{i→j} ∝ ⟨r_i⟩_US − ⟨r_i⟩_baseline with empirical means = spike_count / window length (Hz).
         """
         p = self.params
         if not self._manual_ns_us_learning_enabled():
@@ -950,25 +1039,33 @@ class Network:
         if ns_inds.size == 0 or us_inds.size == 0:
             return
 
-        t_exc = np.asarray(self._spikeMonExc.t / second, dtype=float)
-        i_exc = np.asarray(self._spikeMonExc.i, dtype=np.int64)
-        in_us = (t_exc >= float(us_t0)) & (t_exc < float(us_t1)) & np.isin(i_exc, ns_inds)
-        fired_ns = np.unique(i_exc[in_us])
-        silent_ns = np.setdiff1d(ns_inds, fired_ns)
-
         pre = np.asarray(self._synapsesEE.i, dtype=np.int64)
         post = np.asarray(self._synapsesEE.j, dtype=np.int64)
         ns_to_us = np.isin(pre, ns_inds) & np.isin(post, us_inds)
         if not np.any(ns_to_us):
             return
 
-        pot_delta = p.get('manual_ns_us_trial_pot_delta', 0 * nS)
-        dep_delta = p.get('manual_ns_us_trial_dep_delta', pot_delta)
+        t_us, t_bl = _manual_ns_us_rate_window_seconds(p)
+        eta = p.get('manual_ns_us_diff_eta')
+        if eta is None:
+            pot = p.get('manual_ns_us_trial_pot_delta', 0 * nS)
+            eta = pot * second
+        eta_si = float(eta * Hz / siemens)
+
+        t_exc = np.asarray(self._spikeMonExc.t / second, dtype=float)
+        i_exc = np.asarray(self._spikeMonExc.i, dtype=np.int64)
+        in_trial = (t_exc >= trial_start) & (t_exc < trial_end)
+        in_us_sp = (t_exc >= float(us_t0)) & (t_exc < float(us_t1))
+        in_bl = in_trial & ~in_us_sp
+
         g = np.asarray(self._synapsesEE.gEE / siemens, dtype=np.float64)
-        if fired_ns.size > 0:
-            g[ns_to_us & np.isin(pre, fired_ns)] += float(pot_delta / siemens)
-        if silent_ns.size > 0:
-            g[ns_to_us & np.isin(pre, silent_ns)] -= float(dep_delta / siemens)
+        for i in ns_inds:
+            m_i = i_exc == i
+            n_us = int(np.sum(m_i & in_us_sp))
+            n_bl = int(np.sum(m_i & in_bl))
+            dr = n_us / t_us - n_bl / t_bl
+            dg = eta_si * dr
+            g[ns_to_us & (pre == i)] += dg
         g = np.clip(g, float(p['g_min_EE'] / siemens), float(p['g_max_EE'] / siemens))
         self._synapsesEE.gEE = g * siemens
 
@@ -1221,7 +1318,7 @@ def main():
         stateMonInh,
         params,
     )
-    plot_all_figures(results, show=True)
+    plot_all_figures(results, show=False, save_svg_dir="results/svg")
 
 
 if __name__ == '__main__':

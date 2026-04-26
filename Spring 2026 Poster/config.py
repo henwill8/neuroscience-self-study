@@ -33,15 +33,15 @@ def get_default_params():
         # 'cpu' forces runtime; 'cuda' requires GPU (Linux + CUDA toolkit recommended).
         'brian_device': 'auto',
 
-        'nTrials': 30,
+        'nTrials': 75,
         'ISI': 360 * ms,
         'propCS': 0.05,
         'propUS': 0.05,
         'interTrialInterval': 1 * second,
         # Baseline / setup time before trial 0 CS onset (added to total simulation duration).
-        'pre_first_trial_delay': 10 * ms,
-        'include_CS_only_trial': True,
-        'cs_only_every_n_trials': 5,
+        'pre_first_trial_delay': 20 * ms,
+        'include_CS_only_trial': False,
+        'cs_only_every_n_trials': None,
         'CS_train_duration': 440 * ms,
         'CS_Hz': 25 * Hz,
         'US_train_duration': 80 * ms,
@@ -60,7 +60,7 @@ def get_default_params():
 
         'nUnits': 2e3,
         'propInh': 0.20,
-        'propConnect': 0.10,
+        'propConnect': 0.1,
 
         # E: EIF; C and gL chosen so C/gL = 20 ms like sim.jl (taue=20, C=300, g=15 in paper units).
         'eLeakExc': -70 * mV,
@@ -113,7 +113,7 @@ def get_default_params():
         'taux_vstdp': 15 * ms,
         # vSTDP strengths (LTD: S/V, LTP: S/V^2). LTP multiplies by dt in ms in network.py to
         # match sim.jl's dt*altp*x*(v-thetaltp)*(v_lp-thetaltd) scaling.
-        'altd_vstdp': 8e-10 * siemens / volt,
+        'altd_vstdp': 5e-9 * siemens / volt,
         'altp_vstdp': 1.4e-5 * siemens / (volt * volt),
         'thetaltd_vstdp': -70 * mV,
         'thetaltp_vstdp': -49 * mV,
@@ -132,13 +132,18 @@ def get_default_params():
         'use_homeostatic_norm': True,
         'homeostatic_norm_period': 20 * ms,
         'homeostatic_norm_beta': 1.0,
+        # Homeostatic EE normalization target basis:
+        #   'row'    -> incoming EE sum per postsynaptic neuron (sim.jl-style default)
+        #   'column' -> outgoing EE sum per presynaptic neuron
+        'homeostatic_norm_mode': 'row',
 
         'record_ee_w_stats': True,
         'w_stats_record_dt': 0.5 * second,
-        # Manual trial-end rule for NS->US EE weights:
-        # after each trial, NS neurons that fired in the US window potentiate NS->US;
-        # NS neurons that did not fire in that window depress NS->US.
+        # Manual trial-end NS->US: Δg ∝ ⟨r⟩_US − ⟨r⟩_baseline (Hz) with spike_count/window length;
+        # manual_ns_us_diff_eta maps rate difference to siemens (siemens * second * Hz = siemens).
         'manual_ns_us_trial_learning': False,
+        'manual_ns_us_diff_eta': 0.1 * nS * second,
+        # Legacy fallback if manual_ns_us_diff_eta is omitted (maps ~3 nS per 1 Hz difference).
         'manual_ns_us_trial_pot_delta': 3 * nS,
         'manual_ns_us_trial_dep_delta': 3 * nS,
 
@@ -152,7 +157,8 @@ def get_default_params():
 
         'measure_mean_firing_rates': True,
 
-        'n_record_voltage': 100,
+        # Voltage StateMonitors: None = all E/I units; 0 = one E and one I neuron (lightweight); N>0 = N linspaced each.
+        'n_record_voltage': 0,
         # Exponential low-pass time constant for PCA inputs (binned rates → causal filter, then trial average before fit).
         'pca_lowpass_tau': 50 * ms,
         'save_checkpoint': True,

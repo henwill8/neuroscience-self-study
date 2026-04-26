@@ -47,7 +47,7 @@ def _run_network(params, rng, show_plots=True):
                 f"({fr['n_spikes_I']} spikes / {fr['nInh']} neurons / {fr['duration_s']:.3f} s)"
             )
     if show_plots:
-        plot_all_figures(results, show=True)
+        plot_all_figures(results, show=False, save_svg_dir="results/svg")
     return params, results
 
 
